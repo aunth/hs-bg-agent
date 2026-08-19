@@ -34,10 +34,21 @@ grep -oE 'tag=ZONE value=[A-Z]+' "$P" | sort | uniq -c | sort -rn
 hdr "8. CARDTYPES (minion / hero / hero power / spell / battleground_* )"
 grep -oE 'tag=CARDTYPE value=[A-Z_]+' "$P" | sort | uniq -c | sort -rn
 
-hdr "9. DISCOVER / CHOICES"
-grep -oE '(CHOICES?_?[A-Z_]*|ENTITIES_CHOSEN|SHOW_ENTITY.*DISCOVER)' "$P" | sort | uniq -c | sort -rn | head -15
-echo "-- sample choice blocks --"
-grep -n -A4 'CHOICES' "$P" | head -30
+hdr "9. DISCOVER / CHOICES  (excludes the COIN_MANA_GEM_FOR_CHOICE_CARDS false positive)"
+grep -oE '(^|[^_])CHOICES?[A-Z_]*' "$P" | grep -vE 'COIN_MANA_GEM' | sort | uniq -c | sort -rn | head
+echo "-- real choice blocks --"
+grep -nE 'BLOCK_START.*CHOICE|SHOW_ENTITY.*Updating.*SETASIDE' "$P" | head -10
+echo "-- discover-flagged entities --"
+grep -oE 'BACON_IS_[A-Z_]*DISCOVER[A-Z_]*|BACON_TURNS_LEFT_TO_DISCOVER[A-Z_]*' "$P" | sort | uniq -c
+
+hdr "9b. SHOP vs BOARD SPLIT (player id: you vs Bob)"
+echo "-- entities in PLAY by owning player id --"
+grep -oE 'zone=PLAY zonePos=[0-9]+ cardId=[A-Za-z0-9_]* player=[0-9]+' "$P" | grep -oE 'player=[0-9]+' | sort | uniq -c | sort -rn | head
+echo "-- shop-pool minions --"
+echo "IS_BACON_POOL_MINION: $(grep -c 'IS_BACON_POOL_MINION' "$P")"
+
+hdr "9c. ACTION BUTTONS (each action emits a BLOCK_START on these)"
+grep -oE 'cardId=TB_BaconShop[A-Za-z0-9_]*(Button|DragBuy|DragSell|DragBuy_Spell|CheckTriples)[A-Za-z0-9_]*' "$P" | sort | uniq -c | sort -rn | head
 
 hdr "10. TRINKETS / QUESTS / ANOMALIES / BUDDIES"
 grep -oiE '(trinket|quest|anomal|buddy)[A-Za-z_]*' "$P" | sort | uniq -c | sort -rn | head -20
