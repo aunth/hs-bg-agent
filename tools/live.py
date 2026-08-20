@@ -33,8 +33,9 @@ CLEAR, DIM, BOLD, CYAN, YELLOW, GREEN, RESET = (
 )
 
 
-def render(bg: BGState, session, last_action, connected, choice=None) -> str:
-    L = [f"{BOLD}{CYAN}  Battlegrounds — live state{RESET}",
+def render(bg: BGState, session, last_action, connected, choice=None, flowing=False) -> str:
+    mark = f"{GREEN}● live{RESET}" if flowing else f"{DIM}○ idle{RESET}"
+    L = [f"{BOLD}{CYAN}  Battlegrounds — live state{RESET}   {mark}",
          f"{DIM}  {session.name if session else 'waiting for a game session...'}{RESET}", ""]
     if not connected:
         L += ["  No Power.log yet.", "",
@@ -85,15 +86,22 @@ def main() -> int:
     last_action, last_action_at, dirty, connected = None, 0.0, True, False
     choice = None
     idle_since = time.monotonic()
+    last_data = 0.0
 
-    print(CLEAR + render(bg, None, None, False), flush=True)
+    print(CLEAR + render(bg, None, None, False, None, False), flush=True)
     try:
         while True:
             events = follower.poll()
+            now = time.monotonic()
             if events:
-                connected, idle_since = True, time.monotonic()
-            elif args.once and time.monotonic() - idle_since > 2.0:
+                connected, idle_since = True, now
+                last_data = now
+            elif args.once and now - idle_since > 2.0:
                 break
+
+            flowing = (now - last_data) < 3.0
+            if flowing != getattr(main, "_was_flowing", None):
+                main._was_flowing, dirty = flowing, True
 
             for ev in events:
                 store.apply(ev)
@@ -109,7 +117,8 @@ def main() -> int:
                     if label and not (label == last_action and now - last_action_at < 1.0):
                         last_action, last_action_at = label, now
             if dirty:
-                print(CLEAR + render(bg, follower.session, last_action, connected, choice), flush=True)
+                print(CLEAR + render(bg, follower.session, last_action, connected, choice, flowing),
+                      flush=True)
                 dirty = False
             time.sleep(0.1)
     except KeyboardInterrupt:

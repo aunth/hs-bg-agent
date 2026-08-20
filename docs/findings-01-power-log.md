@@ -94,6 +94,18 @@ Lesson for the parser: entity names are only reliable where the log prints the
 bracketed reference form. `DebugPrintPower` FULL_ENTITY lines give cardId only, so
 names must come either from a bracketed reference or from a card database.
 
+## Verifying that log.config is actually loaded
+
+Do **not** use the `Failed to load config file:` line in `Hearthstone.log` as the
+signal -- it appears at startup even when verbose logging is working correctly, and
+refers to some other config. It is a red herring.
+
+The reliable check is which log files exist in the session directory:
+
+* `Asset.log`, `LoadingScreen.log`, `Net.log` present -> `log.config` was read.
+* `Power.log` and `Zone.log` are created lazily, only once a match begins. Their
+  absence in a freshly launched client is normal and not a fault.
+
 ## Other notes
 
 - `Zone.log` (3.79 MB) carries the same events in a friendlier form —
