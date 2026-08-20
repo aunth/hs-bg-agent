@@ -28,6 +28,7 @@ from hsbg import parser as P  # noqa: E402
 from hsbg.carddb import CardDB  # noqa: E402
 from hsbg.state import BGState, EntityStore  # noqa: E402
 from hsbg.stats import BGStats  # noqa: E402
+from hsbg.advisor import Advisor  # noqa: E402
 from hsbg.tail import PowerLogFollower  # noqa: E402
 
 PANEL_W, MARGIN = 330.0, 18.0
@@ -63,6 +64,7 @@ class Model:
         self.store = EntityStore()
         self.bg = BGState(self.store, CardDB())
         self.stats = BGStats()
+        self.advisor = Advisor(self.bg.cards, self.stats)
         self.choice = None
         self.action = None
         self.action_at = 0.0
@@ -121,19 +123,22 @@ class Model:
                     else:
                         out.append(("     no stats", "dim"))
             out.append(("", "dim"))
+            sugg, fits = self.advisor.evaluate_shop(bg)
+            by_id = {s.card_id: s for s in sugg}
+            best = max((s.score for s in sugg), default=0.0)
             out.append((f"SHOP ({len(bg.shop)})", "sub"))
             for i, m in enumerate(bg.shop, 1):
+                sg = by_id.get(m.card_id)
                 mark = "~" if m.frozen else " "
-                cs = self.stats.card(m.card_id)
-                style = "body"
-                if cs:
-                    style = "good" if cs.impact > 0.10 else ("bad" if cs.impact < -0.10 else "body")
-                out.append((f"{i}.{mark}{m.name}", style))
-                meta = f"    {m.atk}/{m.health}  t{m.tier}  {m.tribe or '—'}"
-                if cs:
-                    sign = "+" if cs.impact >= 0 else ""
-                    meta += f"   {cs.avg_placement:.2f}  {sign}{cs.impact:.2f}"
-                out.append((meta, "dim"))
+                score = sg.score if sg else 0.0
+                top = sg and score == best and score >= 60
+                style = "good" if top else ("body" if score >= 55 else "bad")
+                label = f"{i}.{mark}{m.name}"
+                out.append((f"{label:<24}{score:5.0f}" if sg else label, style))
+                out.append((f"    {m.atk}/{m.health} t{m.tier} {m.tribe or '—'}", "dim"))
+                if sg and sg.reasons:
+                    for r in sg.reasons[:2]:
+                        out.append((f"    · {r}", "dim"))
             if not bg.shop:
                 out.append(("  (empty)", "dim"))
             out.append(("", "dim"))
@@ -142,6 +147,13 @@ class Model:
                 out.append((f"{i}. {m.name}  {m.atk}/{m.health}", "body"))
             if not bg.board:
                 out.append(("  (empty)", "dim"))
+            live_fits = [f for f in fits if f.affinity > 0][:3] if bg.shop else []
+            if live_fits:
+                out.append(("", "dim"))
+                out.append(("BUILDING TOWARD", "sub"))
+                for f in live_fits:
+                    out.append((f"  {f.comp.name}  ({f.comp.power_level})", "body"))
+                    out.append((f"    {f.describe()}", "dim"))
             return out
 
 
