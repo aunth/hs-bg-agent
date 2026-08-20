@@ -21,6 +21,51 @@ from .stats import BGStats, Comp
 
 ROLE_WEIGHT = {"CORE": 1.0, "ADDON": 0.7, "CYCLE": 0.4}
 
+# Battlegrounds runs a subset of tribes per lobby. Recommending a build around a
+# tribe that is not in the game is worse than no advice at all.
+TRIBES_PER_GAME = 5
+
+
+class TribeTracker:
+    """Works out which tribes are in this lobby by watching the shop.
+
+    Only a *single*-tribe minion proves its tribe is active: Ominous Seer is
+    Demon/Naga, so seeing it means Demon or Naga, not both. Dual-tribe minions
+    and Amalgams are therefore ignored as evidence.
+    """
+
+    def __init__(self) -> None:
+        self.proven: set[str] = set()
+        self.ambiguous: set[str] = set()
+
+    def reset(self) -> None:
+        self.proven.clear()
+        self.ambiguous.clear()
+
+    def observe(self, cards: CardDB, minions) -> None:
+        for m in minions:
+            card = cards.by_id(m.card_id)
+            races = [r for r in (card.races if card else ()) if r != "ALL"]
+            if len(races) == 1:
+                self.proven.add(races[0])
+            elif races:
+                self.ambiguous.update(races)
+
+    @property
+    def complete(self) -> bool:
+        """Once we have seen the full slate, anything unseen is absent."""
+        return len(self.proven) >= TRIBES_PER_GAME
+
+    def status(self, tribes: set[str]) -> str:
+        """'active', 'absent', or 'unknown' for a set of tribes."""
+        if not tribes:
+            return "active"                      # neutral builds always work
+        if tribes & self.proven:
+            return "active"
+        if self.complete:
+            return "absent"
+        return "unknown"
+
 
 @dataclass
 class CompFit:
@@ -29,6 +74,11 @@ class CompFit:
     total: int
     tribe_hits: int = 0     # board minions whose tribe this comp is built on
     board_size: int = 0
+    availability: str = "unknown"   # active / absent / unknown
+
+    @property
+    def available(self) -> bool:
+        return self.availability != "absent"
 
     @property
     def progress(self) -> float:
@@ -51,6 +101,10 @@ class CompFit:
             bits.append(f"{self.owned}/{self.total} cards")
         if self.tribe_hits:
             bits.append(f"{self.tribe_hits} on tribe")
+        if self.availability == "absent":
+            bits.append("tribe not in lobby")
+        elif self.availability == "unknown":
+            bits.append("tribe unconfirmed")
         return ", ".join(bits) or "no pieces yet"
 
 
@@ -67,6 +121,7 @@ class Advisor:
         self.cards = cards
         self.stats = stats
         self._tribes: dict[str, set[str]] = {}
+        self.tracker = TribeTracker()
 
     def comp_tribes(self, comp: Comp) -> set[str]:
         """The tribes a comp is actually built around, inferred from its cards."""
@@ -93,8 +148,12 @@ class Advisor:
             hits = sum(1 for cid in comp.cards if cid in owned_set)
             tribes = self.comp_tribes(comp)
             tribe_hits = sum(n for r, n in board_tribes.items() if r in tribes)
-            fits.append(CompFit(comp, hits, len(comp.cards), tribe_hits, board_size))
-        return sorted(fits, key=lambda f: (-f.affinity, -f.comp.quality))
+            fits.append(CompFit(comp, hits, len(comp.cards), tribe_hits, board_size,
+                                self.tracker.status(tribes)))
+        # Builds whose tribe is not in this lobby sort last, whatever their power.
+        rank = {"active": 0, "unknown": 1, "absent": 2}
+        return sorted(fits, key=lambda f: (rank[f.availability], -f.affinity,
+                                           -f.comp.quality))
 
     # -- scoring --------------------------------------------------------
     def score_card(self, card_id: str, board_tribes: dict[str, int],
@@ -122,7 +181,7 @@ class Advisor:
         best = None
         for fit in fits:
             role = fit.comp.cards.get(card_id)
-            if not role:
+            if not role or not fit.available:
                 continue
             weight = ROLE_WEIGHT.get(role, 0.5)
             # A comp you have pieces of is worth far more than one you don't.
@@ -144,6 +203,8 @@ class Advisor:
         return Suggestion(card_id, name, max(0.0, min(100.0, score)), reasons)
 
     def evaluate_shop(self, bg) -> tuple[list[Suggestion], list[CompFit]]:
+        # Everything the shop offers is evidence about which tribes are in play.
+        self.tracker.observe(self.cards, list(bg.shop) + list(bg.board))
         owned = [m.card_id for m in bg.board] + [m.card_id for m in bg.hand]
         tribes: dict[str, int] = {}
         for m in bg.board:

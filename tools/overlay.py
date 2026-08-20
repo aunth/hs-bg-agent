@@ -33,7 +33,8 @@ from hsbg.art import ArtCache  # noqa: E402
 from hsbg.tail import PowerLogFollower  # noqa: E402
 
 PANEL_W, MARGIN = 330.0, 18.0
-CARD_W, CARD_H, CARD_GAP = 88.0, 133.0, 7.0     # 256x388 rendered card, scaled
+CARD_W, CARD_H, CARD_GAP = 72.0, 109.0, 6.0     # 256x388 rendered card, scaled
+ROW_H, BOARDS = CARD_H + 40.0, 3                 # how many builds to show
 BOARD_MAX = 7
 BUTTONS = {
     "TB_BaconShop_DragBuy": "BUY", "TB_BaconShop_DragBuy_Spell": "BUY SPELL",
@@ -102,25 +103,31 @@ class Model:
                     self.last_data = time.time()
             time.sleep(0.12)
 
-    def target(self):
-        """(comp, [(card_id, role, owned)]) for the most plausible build."""
+    def targets(self, limit: int = BOARDS):
+        """[(fit, [(card_id, role, owned)])] for the most plausible builds.
+
+        Builds whose tribe is not in this lobby are dropped entirely -- they are
+        not options, so showing them would be noise.
+        """
         with self.lock:
             bg = self.bg
             if not self.stats.comps:
-                return None
+                return []
             owned = {m.card_id for m in bg.board} | {m.card_id for m in bg.hand}
             tribes: dict[str, int] = {}
             for m in bg.board:
                 card = bg.cards.by_id(m.card_id) if bg.cards else None
                 for r in (card.races if card else ()):
                     tribes[r] = tribes.get(r, 0) + 1
-            fits = self.advisor.comp_fits(list(owned), tribes, len(bg.board))
-            if not fits:
-                return None
-            fit = fits[0]
+            fits = [f for f in self.advisor.comp_fits(list(owned), tribes, len(bg.board))
+                    if f.available]
             order = {"CORE": 0, "ADDON": 1, "CYCLE": 2}
-            cards = sorted(fit.comp.cards.items(), key=lambda kv: order.get(kv[1], 3))
-            return fit, [(cid, role, cid in owned) for cid, role in cards[:BOARD_MAX]]
+            out = []
+            for fit in fits[:limit]:
+                cards = sorted(fit.comp.cards.items(), key=lambda kv: order.get(kv[1], 3))
+                out.append((fit, [(cid, role, cid in owned)
+                                  for cid, role in cards[:BOARD_MAX]]))
+            return out
 
     def lines(self):
         """(text, style) pairs for the panel."""
@@ -280,7 +287,6 @@ class BoardView(AppKit.NSView):
         path.setLineWidth_(1.0)
         path.stroke()
 
-        target = self.model.target()
         def label(text, x, y, style):
             size, weight, color = STYLES[style]
             font = AppKit.NSFont.monospacedSystemFontOfSize_weight_(size, weight)
@@ -288,37 +294,49 @@ class BoardView(AppKit.NSView):
                 (x, y), {AppKit.NSFontAttributeName: font,
                          AppKit.NSForegroundColorAttributeName: color})
 
-        if not target:
-            label("no build data", 14.0, 12.0, "dim")
+        targets = self.model.targets()
+        tracker = self.model.advisor.tracker
+        # Two lines: the tribe list overflowed a single header at panel width.
+        label("BUILDS FOR THIS LOBBY", 14.0, 8.0, "head")
+        if tracker.proven:
+            tribes = " · ".join(t.title() for t in sorted(tracker.proven))
+            suffix = "" if tracker.complete else "  (still learning)"
+            label(f"tribes in play: {tribes}{suffix}", 14.0, 24.0, "dim")
+        else:
+            label("tribes in play: learning from the shop…", 14.0, 24.0, "dim")
+        if not targets:
+            label("no viable build yet", 14.0, 42.0, "dim")
             return
-        fit, cards = target
-        label(f"TARGET BOARD — {fit.comp.name} ({fit.comp.power_level})", 14.0, 10.0, "head")
-        label(fit.describe(), 14.0, 27.0, "dim")
 
-        x, top = 14.0, 46.0
-        for card_id, role, owned in cards:
-            img = self.image_for(card_id)
-            frame = ((x, top), (CARD_W, CARD_H))
-            if img:
-                # Cards you already hold stay bright; the rest are dimmed.
-                img.drawInRect_fromRect_operation_fraction_respectFlipped_hints_(
-                    frame, AppKit.NSZeroRect, AppKit.NSCompositingOperationSourceOver,
-                    1.0 if owned else 0.42, True, None)
-            else:
-                C.colorWithRed_green_blue_alpha_(1, 1, 1, 0.06).set()
-                AppKit.NSBezierPath.bezierPathWithRect_(frame).fill()
-            if owned:
-                C.colorWithRed_green_blue_alpha_(0.45, 0.90, 0.55, 0.95).set()
-                ring = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(frame, 5, 5)
-                ring.setLineWidth_(2.0)
-                ring.stroke()
-            name = (self.model.bg.cards.name(card_id) if self.model.bg.cards else card_id)
-            if len(name) > 15:
-                name = name[:14] + "…"
-            label(name, x + 1, top + CARD_H + 4, "cardhave" if owned else "cardname")
-            label("HAVE" if owned else role.title(), x + 1, top + CARD_H + 17,
-                  "cardhave" if owned else "cardrole")
-            x += CARD_W + CARD_GAP
+        y = 44.0
+        for fit, cards in targets:
+            label(f"{fit.comp.name} ({fit.comp.power_level})", 14.0, y, "sub")
+            label(fit.describe(), 190.0, y, "dim")
+            top = y + 15.0
+            x = 14.0
+            for card_id, role, owned in cards:
+                img = self.image_for(card_id)
+                frame = ((x, top), (CARD_W, CARD_H))
+                if img:
+                    # Cards you already hold stay bright; the rest are dimmed.
+                    img.drawInRect_fromRect_operation_fraction_respectFlipped_hints_(
+                        frame, AppKit.NSZeroRect, AppKit.NSCompositingOperationSourceOver,
+                        1.0 if owned else 0.40, True, None)
+                else:
+                    C.colorWithRed_green_blue_alpha_(1, 1, 1, 0.06).set()
+                    AppKit.NSBezierPath.bezierPathWithRect_(frame).fill()
+                if owned:
+                    C.colorWithRed_green_blue_alpha_(0.45, 0.90, 0.55, 0.95).set()
+                    ring = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        frame, 4, 4)
+                    ring.setLineWidth_(2.0)
+                    ring.stroke()
+                name = (self.model.bg.cards.name(card_id) if self.model.bg.cards else card_id)
+                if len(name) > 12:
+                    name = name[:11] + "…"
+                label(name, x + 1, top + CARD_H + 3, "cardhave" if owned else "cardname")
+                x += CARD_W + CARD_GAP
+            y += ROW_H
 
 
 class Overlay(AppKit.NSObject):
@@ -343,8 +361,9 @@ class Overlay(AppKit.NSObject):
         self.window.orderFrontRegardless()
 
         board_w = 14.0 * 2 + BOARD_MAX * (CARD_W + CARD_GAP)
+        board_h = 52.0 + BOARDS * ROW_H
         self.board_window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((0, 0), (board_w, CARD_H + 84)), style, AppKit.NSBackingStoreBuffered, False
+            ((0, 0), (board_w, board_h)), style, AppKit.NSBackingStoreBuffered, False
         )
         for w in (self.board_window,):
             w.setOpaque_(False)
@@ -359,7 +378,7 @@ class Overlay(AppKit.NSObject):
         self.board_view = BoardView.alloc().initWithModel_(model)
         self.board_window.setContentView_(self.board_view)
         self.board_window.orderFrontRegardless()
-        self.board_w = board_w
+        self.board_w, self.board_h = board_w, board_h
         return self
 
     def tick_(self, _timer):
@@ -380,7 +399,7 @@ class Overlay(AppKit.NSObject):
         self.window.setFrame_display_(((x, y), (PANEL_W, height)), True)
         self.view.setNeedsDisplay_(True)
         # Target board sits along the bottom of the game window.
-        bh = CARD_H + 84
+        bh = self.board_h
         if b:
             bx = b["X"] + MARGIN
             by = primary_h - (b["Y"] + b["Height"]) + MARGIN

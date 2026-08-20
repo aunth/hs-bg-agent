@@ -28,23 +28,24 @@ out = sys.argv[2] if len(sys.argv) > 2 else str(ROOT / "target_board.png")
 AppKit.NSApplication.sharedApplication()
 model = ns["Model"]()
 if cap:
+    # Mirror the live path: the tribe tracker learns from each shop as it appears,
+    # so replaying state alone is not enough.
     for ev in P.parse_file(cap):
         model.store.apply(ev)
+        if model.bg.shop:
+            model.advisor.tracker.observe(model.bg.cards, list(model.bg.shop))
     model.last_data = 9e9    # suppress the stale banner for the preview
 
 view = ns["BoardView"].alloc().initWithModel_(model)
 w = 14.0 * 2 + ns["BOARD_MAX"] * (ns["CARD_W"] + ns["CARD_GAP"])
-h = ns["CARD_H"] + 74
+h = 52.0 + ns["BOARDS"] * ns["ROW_H"]
 view.setFrame_(((0, 0), (w, h)))
 
 rep = view.bitmapImageRepForCachingDisplayInRect_(view.bounds())
 view.cacheDisplayInRect_toBitmapImageRep_(view.bounds(), rep)
 data = rep.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
 Path(out).write_bytes(bytes(data))
-target = model.target()
 print(f"wrote {out}  ({w:.0f}x{h:.0f})")
-if target:
-    fit, cards = target
-    print(f"target: {fit.comp.name} ({fit.comp.power_level})  {fit.describe()}")
-    print("cards:", ", ".join(f"{model.bg.cards.name(c)}{'*' if own else ''}"
-                              for c, r, own in cards))
+print("active tribes:", ", ".join(sorted(model.advisor.tracker.proven)) or "none yet")
+for fit, cards in model.targets():
+    print(f"  {fit.comp.name} ({fit.comp.power_level}) — {fit.describe()}")
