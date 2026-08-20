@@ -60,20 +60,39 @@ Freeze resolves cleanly — pressing `TB_BaconShopLockAll_Button` emits
 | Triples | CONFIRMED | `BACON_TRIPLE_UPGRADE_MINION_ID` carries the dbId of the upgrade |
 | Turn structure | CONFIRMED | `TURN`, `STEP`, `NEXT_STEP`, `PLAYSTATE` |
 | Leaderboard | CONFIRMED | `PLAYER_LEADERBOARD_PLACE` |
-| **Discover** | **UNCONFIRMED** | see below |
+| Discover | CONFIRMED | `GameState.DebugPrintEntityChoices()` — see correction below |
 
-## The one gap: Discover
+## Correction: Discover is fully logged
 
-The probe's original `CHOICE_CARDS` hits were false positives — both were the
-game-entity config tag `COIN_MANA_GEM_FOR_CHOICE_CARDS`, not an actual discover.
-No real discover occurred in this capture: it ran only ~4 turns and the trinket
-countdown still read `BACON_TURNS_LEFT_TO_DISCOVER_TRINKET value=5`.
+An earlier revision of this document recorded Discover as unconfirmed. That was
+wrong, and the reason is worth keeping: the probe only grepped
+`GameState.DebugPrintPower()`, but choices are emitted on two *separate* channels.
 
-This is unconfirmed, **not** absent. Hero selection worked without a CHOICES block
-(the 4 candidate heroes were simply dealt into `zone=HAND` with `CARDTYPE=HERO`), so
-Battlegrounds may represent discovers as SETASIDE entities rather than the constructed
--mode `CHOICES` power. Needs a second capture from a full-length game that includes a
-trinket discover and a battlecry discover.
+Offers arrive on `GameState.DebugPrintEntityChoices()`:
+
+```
+id=1 Player=<battletag> TaskList=7 ChoiceType=MULLIGAN CountMin=1 CountMax=1
+  Source=GameEntity
+  Entities[0]=[entityName=Mixmaster N'Zoth id=89 ... cardId=TB_BaconShop_HERO_93_SKIN_B player=4]
+  Entities[1]=[entityName=Cookie the Cook id=91 ... cardId=BG21_HERO_020 player=4]
+  Entities[2]=[entityName=Artanis id=92 ... cardId=BG31_HERO_802 player=4]
+  Entities[3]=[entityName=Magister Dawngrasp id=90 ... cardId=BG22_HERO_004_SKIN_B player=4]
+```
+
+Resolutions arrive on `GameState.DebugPrintEntitiesChosen()`:
+
+```
+id=1 Player=<battletag> EntitiesCount=1
+  Entities[0]=[entityName=Artanis id=92 ... cardId=BG31_HERO_802 player=4]
+```
+
+`ChoiceType=MULLIGAN` is the opening hero select and carries all four candidates
+**with their display names**, which is exactly what a hero-pick advisor needs.
+`ChoiceType=GENERAL` covers in-game discovers.
+
+Lesson for the parser: entity names are only reliable where the log prints the
+bracketed reference form. `DebugPrintPower` FULL_ENTITY lines give cardId only, so
+names must come either from a bracketed reference or from a card database.
 
 ## Other notes
 

@@ -13,7 +13,10 @@ import re
 from dataclasses import dataclass, field
 
 # Only GameState lines. PowerTaskList is the animation queue -- see module docstring.
-_LINE = re.compile(r"^D \d\d:\d\d:\d\d\.\d+ GameState\.DebugPrintPower\(\) - (?P<body>.*)$")
+_LINE = re.compile(
+    r"^D \d\d:\d\d:\d\d\.\d+ GameState\.(?P<chan>DebugPrintPower|DebugPrintEntityChoices|"
+    r"DebugPrintEntitiesChosen)\(\) - (?P<body>.*)$"
+)
 
 _TAG = re.compile(r"^tag=(?P<tag>[A-Za-z0-9_]+) value=(?P<value>[A-Za-z0-9_-]+)$")
 _FULL_ENTITY = re.compile(r"^FULL_ENTITY - (?:Creating|Updating) ID=(?P<id>\d+) CardID=(?P<card>\S*)$")
@@ -23,6 +26,16 @@ _TAG_CHANGE = re.compile(r"^TAG_CHANGE Entity=(?P<ref>.+?) tag=(?P<tag>[A-Za-z0-
 _BLOCK_START = re.compile(r"^BLOCK_START BlockType=(?P<type>\S+) Entity=(?P<ref>.+?) EffectCardId=(?P<effect>.*?) EffectIndex=")
 _PLAYER = re.compile(r"^Player EntityID=(?P<eid>\d+) PlayerID=(?P<pid>\d+) GameAccountId=\[hi=(?P<hi>\d+) lo=(?P<lo>\d+)\]")
 _GAME_ENTITY = re.compile(r"^GameEntity EntityID=(?P<eid>\d+)$")
+
+# Discover / hero select, on the DebugPrintEntityChoices channel:
+#   id=1 Player=name TaskList=7 ChoiceType=MULLIGAN CountMin=1 CountMax=1
+#     Entities[0]=[entityName=Artanis id=92 ... ]
+_CHOICE_HEADER = re.compile(
+    r"^id=(?P<id>\d+) Player=(?P<player>.+?) TaskList=(?P<tasklist>\d+) "
+    r"ChoiceType=(?P<ctype>\S+) CountMin=(?P<cmin>\d+) CountMax=(?P<cmax>\d+)"
+)
+_CHOSEN_HEADER = re.compile(r"^id=(?P<id>\d+) Player=(?P<player>.+?) EntitiesCount=(?P<count>\d+)")
+_ENTITIES_IDX = re.compile(r"^Entities\[\d+\]=(?P<ref>.+)$")
 
 # The bracketed reference form, e.g.
 #   [entityName=Flittering Bat id=377 zone=PLAY zonePos=3 cardId=BG36_200 player=12]
@@ -133,6 +146,24 @@ class BlockEnd:
     pass
 
 
+@dataclass
+class ChoiceOffered:
+    """A Discover / hero-select prompt. ChoiceType is MULLIGAN for hero picks."""
+    choice_id: int
+    player: str
+    choice_type: str
+    count_min: int
+    count_max: int
+    entities: list[EntityRef] = field(default_factory=list)
+
+
+@dataclass
+class ChoiceMade:
+    choice_id: int
+    player: str
+    entities: list[EntityRef] = field(default_factory=list)
+
+
 # Events that own the tag= lines indented beneath them.
 _TAG_OWNERS = (GameEntityDecl, PlayerDecl, FullEntity, ShowEntity, HideEntity)
 
@@ -153,10 +184,29 @@ def parse_lines(lines):
         m = _LINE.match(raw.rstrip("\n"))
         if not m:
             continue
+        chan = m["chan"]
         body = m["body"]
         indent = len(body) - len(body.lstrip(" "))
         content = body.strip()
         if not content:
+            continue
+
+        if chan != "DebugPrintPower":
+            em = _ENTITIES_IDX.match(content)
+            if em and isinstance(pending, (ChoiceOffered, ChoiceMade)):
+                pending.entities.append(parse_ref(em["ref"]))
+                continue
+            if content.startswith("Source="):
+                continue
+            done = flush()
+            if done is not None:
+                yield done
+            if chan == "DebugPrintEntityChoices" and (h := _CHOICE_HEADER.match(content)):
+                pending, pending_indent = ChoiceOffered(
+                    int(h["id"]), h["player"], h["ctype"], int(h["cmin"]), int(h["cmax"])
+                ), indent
+            elif chan == "DebugPrintEntitiesChosen" and (h := _CHOSEN_HEADER.match(content)):
+                pending, pending_indent = ChoiceMade(int(h["id"]), h["player"]), indent
             continue
 
         # A tag line belongs to the open declaration above it.
