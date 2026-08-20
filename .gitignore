@@ -8,3 +8,4 @@ venv/
 data/cards.json
 .venv/
 data/stats/
+data/art/

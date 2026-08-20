@@ -29,9 +29,12 @@ from hsbg.carddb import CardDB  # noqa: E402
 from hsbg.state import BGState, EntityStore  # noqa: E402
 from hsbg.stats import BGStats  # noqa: E402
 from hsbg.advisor import Advisor  # noqa: E402
+from hsbg.art import ArtCache  # noqa: E402
 from hsbg.tail import PowerLogFollower  # noqa: E402
 
 PANEL_W, MARGIN = 330.0, 18.0
+CARD_W, CARD_H, CARD_GAP = 88.0, 133.0, 7.0     # 256x388 rendered card, scaled
+BOARD_MAX = 7
 BUTTONS = {
     "TB_BaconShop_DragBuy": "BUY", "TB_BaconShop_DragBuy_Spell": "BUY SPELL",
     "TB_BaconShop_DragSell": "SELL", "TB_BaconShop_8p_Reroll_Button": "REROLL",
@@ -65,6 +68,7 @@ class Model:
         self.bg = BGState(self.store, CardDB())
         self.stats = BGStats()
         self.advisor = Advisor(self.bg.cards, self.stats)
+        self.art = ArtCache()
         self.choice = None
         self.action = None
         self.action_at = 0.0
@@ -97,6 +101,26 @@ class Model:
                     self.session = follower.session
                     self.last_data = time.time()
             time.sleep(0.12)
+
+    def target(self):
+        """(comp, [(card_id, role, owned)]) for the most plausible build."""
+        with self.lock:
+            bg = self.bg
+            if not self.stats.comps:
+                return None
+            owned = {m.card_id for m in bg.board} | {m.card_id for m in bg.hand}
+            tribes: dict[str, int] = {}
+            for m in bg.board:
+                card = bg.cards.by_id(m.card_id) if bg.cards else None
+                for r in (card.races if card else ()):
+                    tribes[r] = tribes.get(r, 0) + 1
+            fits = self.advisor.comp_fits(list(owned), tribes, len(bg.board))
+            if not fits:
+                return None
+            fit = fits[0]
+            order = {"CORE": 0, "ADDON": 1, "CYCLE": 2}
+            cards = sorted(fit.comp.cards.items(), key=lambda kv: order.get(kv[1], 3))
+            return fit, [(cid, role, cid in owned) for cid, role in cards[:BOARD_MAX]]
 
     def lines(self):
         """(text, style) pairs for the panel."""
@@ -191,6 +215,12 @@ STYLES = {
     "good": (13.0, AppKit.NSFontWeightSemibold, C.colorWithRed_green_blue_alpha_(0.45, 0.90, 0.55, 1.0)),
     "bad":  (13.0, AppKit.NSFontWeightRegular, C.colorWithRed_green_blue_alpha_(0.95, 0.50, 0.45, 1.0)),
     "warn": (12.0, AppKit.NSFontWeightBold, C.colorWithRed_green_blue_alpha_(1.0, 0.62, 0.25, 1.0)),
+    "cardname": (9.0, AppKit.NSFontWeightMedium,
+                 C.colorWithRed_green_blue_alpha_(0.90, 0.91, 0.94, 1.0)),
+    "cardhave": (9.0, AppKit.NSFontWeightBold,
+                 C.colorWithRed_green_blue_alpha_(0.45, 0.90, 0.55, 1.0)),
+    "cardrole": (8.5, AppKit.NSFontWeightRegular,
+                 C.colorWithRed_green_blue_alpha_(0.55, 0.58, 0.64, 1.0)),
 }
 
 
@@ -224,6 +254,73 @@ class PanelView(AppKit.NSView):
             y += size + 5
 
 
+class BoardView(AppKit.NSView):
+    def initWithModel_(self, model):
+        self = objc.super(BoardView, self).init()
+        self.model = model
+        self._images = {}
+        return self
+
+    def isFlipped(self):
+        return True
+
+    def image_for(self, card_id):
+        if card_id not in self._images:
+            path = self.model.art.best(card_id, fetch=False)
+            img = AppKit.NSImage.alloc().initWithContentsOfFile_(str(path)) if path else None
+            self._images[card_id] = img
+        return self._images[card_id]
+
+    def drawRect_(self, rect):
+        bounds = self.bounds()
+        C.colorWithRed_green_blue_alpha_(0.05, 0.06, 0.09, 0.82).set()
+        path = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, 10, 10)
+        path.fill()
+        C.colorWithRed_green_blue_alpha_(1, 1, 1, 0.10).set()
+        path.setLineWidth_(1.0)
+        path.stroke()
+
+        target = self.model.target()
+        def label(text, x, y, style):
+            size, weight, color = STYLES[style]
+            font = AppKit.NSFont.monospacedSystemFontOfSize_weight_(size, weight)
+            AppKit.NSString.stringWithString_(text).drawAtPoint_withAttributes_(
+                (x, y), {AppKit.NSFontAttributeName: font,
+                         AppKit.NSForegroundColorAttributeName: color})
+
+        if not target:
+            label("no build data", 14.0, 12.0, "dim")
+            return
+        fit, cards = target
+        label(f"TARGET BOARD — {fit.comp.name} ({fit.comp.power_level})", 14.0, 10.0, "head")
+        label(fit.describe(), 14.0, 27.0, "dim")
+
+        x, top = 14.0, 46.0
+        for card_id, role, owned in cards:
+            img = self.image_for(card_id)
+            frame = ((x, top), (CARD_W, CARD_H))
+            if img:
+                # Cards you already hold stay bright; the rest are dimmed.
+                img.drawInRect_fromRect_operation_fraction_respectFlipped_hints_(
+                    frame, AppKit.NSZeroRect, AppKit.NSCompositingOperationSourceOver,
+                    1.0 if owned else 0.42, True, None)
+            else:
+                C.colorWithRed_green_blue_alpha_(1, 1, 1, 0.06).set()
+                AppKit.NSBezierPath.bezierPathWithRect_(frame).fill()
+            if owned:
+                C.colorWithRed_green_blue_alpha_(0.45, 0.90, 0.55, 0.95).set()
+                ring = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(frame, 5, 5)
+                ring.setLineWidth_(2.0)
+                ring.stroke()
+            name = (self.model.bg.cards.name(card_id) if self.model.bg.cards else card_id)
+            if len(name) > 15:
+                name = name[:14] + "…"
+            label(name, x + 1, top + CARD_H + 4, "cardhave" if owned else "cardname")
+            label("HAVE" if owned else role.title(), x + 1, top + CARD_H + 17,
+                  "cardhave" if owned else "cardrole")
+            x += CARD_W + CARD_GAP
+
+
 class Overlay(AppKit.NSObject):
     def initWithModel_(self, model):
         self = objc.super(Overlay, self).init()
@@ -244,6 +341,25 @@ class Overlay(AppKit.NSObject):
         self.view = PanelView.alloc().initWithModel_(model)
         self.window.setContentView_(self.view)
         self.window.orderFrontRegardless()
+
+        board_w = 14.0 * 2 + BOARD_MAX * (CARD_W + CARD_GAP)
+        self.board_window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            ((0, 0), (board_w, CARD_H + 84)), style, AppKit.NSBackingStoreBuffered, False
+        )
+        for w in (self.board_window,):
+            w.setOpaque_(False)
+            w.setBackgroundColor_(C.clearColor())
+            w.setIgnoresMouseEvents_(True)
+            w.setLevel_(AppKit.NSScreenSaverWindowLevel)
+            w.setCollectionBehavior_(
+                AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+                | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+                | AppKit.NSWindowCollectionBehaviorStationary
+            )
+        self.board_view = BoardView.alloc().initWithModel_(model)
+        self.board_window.setContentView_(self.board_view)
+        self.board_window.orderFrontRegardless()
+        self.board_w = board_w
         return self
 
     def tick_(self, _timer):
@@ -263,6 +379,15 @@ class Overlay(AppKit.NSObject):
             x, y = MARGIN, MARGIN
         self.window.setFrame_display_(((x, y), (PANEL_W, height)), True)
         self.view.setNeedsDisplay_(True)
+        # Target board sits along the bottom of the game window.
+        bh = CARD_H + 84
+        if b:
+            bx = b["X"] + MARGIN
+            by = primary_h - (b["Y"] + b["Height"]) + MARGIN
+        else:
+            bx, by = MARGIN, MARGIN
+        self.board_window.setFrame_display_(((bx, by), (self.board_w, bh)), True)
+        self.board_view.setNeedsDisplay_(True)
 
 
 def main():
