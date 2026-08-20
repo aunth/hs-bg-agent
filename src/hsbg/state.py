@@ -242,9 +242,25 @@ class BGState:
             return 0
 
     @property
-    def turn(self) -> int:
+    def raw_turn(self) -> int:
+        """The game's TURN tag, which counts shop *and* combat phases."""
         g = self.s.entities.get(self.s.game_entity_id or -1)
         return g.int_tag("TURN") if g else 0
+
+    @property
+    def turn(self) -> int:
+        """The Battlegrounds turn number as the player sees it.
+
+        Each Battlegrounds turn spans two logged turns -- one shop, one combat --
+        so the raw tag runs at roughly double. Verified against gold, which is
+        min(10, turn + 2): raw 11 -> turn 6 -> 8 gold.
+        """
+        raw = self.raw_turn
+        return (raw + 1) // 2 if raw else 0
+
+    @property
+    def max_gold(self) -> int:
+        return min(10, self.turn + 2) if self.turn else 0
 
     @property
     def hero_offers(self) -> list[Entity]:
