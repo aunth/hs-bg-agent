@@ -299,11 +299,14 @@ class BoardView(AppKit.NSView):
         # Two lines: the tribe list overflowed a single header at panel width.
         label("BUILDS FOR THIS LOBBY", 14.0, 8.0, "head")
         if tracker.proven:
-            tribes = " · ".join(t.title() for t in sorted(tracker.proven))
-            suffix = "" if tracker.complete else "  (still learning)"
-            label(f"tribes in play: {tribes}{suffix}", 14.0, 24.0, "dim")
+            # Name the minion that proved each tribe, so the call is checkable.
+            tribes = " · ".join(
+                f"{t.title()} ({tracker.witness.get(t, '?')})"
+                for t in sorted(tracker.proven))
+            suffix = "" if tracker.complete else "  +learning"
+            label(f"tribes: {tribes}{suffix}"[:96], 14.0, 24.0, "dim")
         else:
-            label("tribes in play: learning from the shop…", 14.0, 24.0, "dim")
+            label("tribes: learning from the shop…", 14.0, 24.0, "dim")
         if not targets:
             label("no viable build yet", 14.0, 42.0, "dim")
             return

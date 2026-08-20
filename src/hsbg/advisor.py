@@ -37,10 +37,13 @@ class TribeTracker:
     def __init__(self) -> None:
         self.proven: set[str] = set()
         self.ambiguous: set[str] = set()
+        # Which minion proved each tribe, so the conclusion can be audited.
+        self.witness: dict[str, str] = {}
 
     def reset(self) -> None:
         self.proven.clear()
         self.ambiguous.clear()
+        self.witness.clear()
 
     def observe(self, cards: CardDB, minions) -> None:
         for m in minions:
@@ -48,6 +51,7 @@ class TribeTracker:
             races = [r for r in (card.races if card else ()) if r != "ALL"]
             if len(races) == 1:
                 self.proven.add(races[0])
+                self.witness.setdefault(races[0], card.name if card else m.card_id)
             elif races:
                 self.ambiguous.update(races)
 
