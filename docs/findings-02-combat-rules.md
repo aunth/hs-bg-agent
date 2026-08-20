@@ -50,3 +50,18 @@ both boards during combat, so it can serve as the test oracle.
 * Deathrattle effects beyond Reborn are unimplemented — the registry
   (`DEATHRATTLES`) exists and is empty. This is the grind: 48 cards.
 * Start-of-combat effects, auras, and attack triggers are not modelled.
+
+## Game modes
+
+Battlegrounds Duos uses a different card pool (172 `BGDUO_*` cards) and its own
+meta. All statistics we fetch are **solo** Battlegrounds, so applying them to a
+Duos game gives quietly wrong numbers.
+
+Detection: any `BGDUO_*` cardId in the shop is positive proof of Duos. This is
+one-directional -- absence early in a game proves nothing, so the flag only ever
+turns on. `LoadingScreen.log` also records `currMode=BACON` for solo, but the
+corresponding Duos value is unconfirmed (we have no Duos capture).
+
+No Duos statistics endpoint was found under any obvious path on the CDN. Adding
+Duos support would mean finding the real path from the site's own requests, plus
+modelling a teammate board.

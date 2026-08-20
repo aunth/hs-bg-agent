@@ -39,14 +39,20 @@ class TribeTracker:
         self.ambiguous: set[str] = set()
         # Which minion proved each tribe, so the conclusion can be audited.
         self.witness: dict[str, str] = {}
+        # Duos runs its own card pool and meta; our stats are solo Battlegrounds.
+        self.duos = False
 
     def reset(self) -> None:
         self.proven.clear()
         self.ambiguous.clear()
         self.witness.clear()
+        self.duos = False
 
     def observe(self, cards: CardDB, minions) -> None:
         for m in minions:
+            if m.card_id.startswith("BGDUO"):
+                # Duos-exclusive card: positive proof of the mode.
+                self.duos = True
             card = cards.by_id(m.card_id)
             races = [r for r in (card.races if card else ()) if r != "ALL"]
             if len(races) == 1:

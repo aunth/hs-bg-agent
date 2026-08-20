@@ -297,7 +297,11 @@ class BoardView(AppKit.NSView):
         targets = self.model.targets()
         tracker = self.model.advisor.tracker
         # Two lines: the tribe list overflowed a single header at panel width.
-        label("BUILDS FOR THIS LOBBY", 14.0, 8.0, "head")
+        title = "BUILDS FOR THIS LOBBY"
+        label(title, 14.0, 8.0, "head")
+        if tracker.duos:
+            label("DUOS — scores are solo-BG data, treat as rough",
+                  20.0 + len(title) * 7.6, 9.0, "warn")
         if tracker.proven:
             # Name the minion that proved each tribe, so the call is checkable.
             tribes = " · ".join(
