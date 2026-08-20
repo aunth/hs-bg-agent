@@ -38,8 +38,9 @@ if cap:
 
 view = ns["BoardView"].alloc().initWithModel_(model)
 w = 14.0 * 2 + ns["BOARD_MAX"] * (ns["CARD_W"] + ns["CARD_GAP"])
-h = 52.0 + ns["BOARDS"] * ns["ROW_H"]
+h = ns["ROWS_TOP"] + ns["BOARDS"] * ns["TITLE_H"] + ns["CARD_H"] + 46.0
 view.setFrame_(((0, 0), (w, h)))
+view.hover_row = 0          # preview the first build expanded
 
 rep = view.bitmapImageRepForCachingDisplayInRect_(view.bounds())
 view.cacheDisplayInRect_toBitmapImageRep_(view.bounds(), rep)

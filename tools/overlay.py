@@ -12,6 +12,7 @@ The log tells us *what* is in the shop and in what left-to-right order, never
 where it sits on screen, so the panel lists the shop in order and you read it
 against the cards. Quitting: Ctrl-C in the terminal that launched it.
 """
+import signal
 import sys
 import threading
 import time
@@ -34,7 +35,8 @@ from hsbg.tail import PowerLogFollower  # noqa: E402
 
 PANEL_W, MARGIN = 330.0, 18.0
 CARD_W, CARD_H, CARD_GAP = 72.0, 109.0, 6.0     # 256x388 rendered card, scaled
-ROW_H, BOARDS = CARD_H + 40.0, 3                 # how many builds to show
+BOARDS, TITLE_H = 3, 19.0                       # builds listed, row height
+ROWS_TOP = 58.0                                 # header is three lines
 BOARD_MAX = 7
 BUTTONS = {
     "TB_BaconShop_DragBuy": "BUY", "TB_BaconShop_DragBuy_Spell": "BUY SPELL",
@@ -91,6 +93,8 @@ class Model:
                         self.store.apply(ev)
                         if isinstance(ev, P.CreateGame):
                             self.choice, self.action = None, None
+                            # Each lobby has its own tribe slate and mode.
+                            self.advisor.tracker.reset()
                         if isinstance(ev, P.ChoiceOffered):
                             self.choice = ev
                         elif isinstance(ev, P.ChoiceMade):
@@ -266,7 +270,16 @@ class BoardView(AppKit.NSView):
         self = objc.super(BoardView, self).init()
         self.model = model
         self._images = {}
+        self.hover_row = -1        # set by the timer from the cursor position
         return self
+
+    def row_at(self, point) -> int:
+        """Which build row a point in view coordinates falls on, or -1."""
+        x, y = point
+        if x < 8 or x > self.bounds().size.width - 8:
+            return -1
+        idx = int((y - ROWS_TOP) // TITLE_H)
+        return idx if 0 <= idx < BOARDS else -1
 
     def isFlipped(self):
         return True
@@ -304,23 +317,41 @@ class BoardView(AppKit.NSView):
                   20.0 + len(title) * 7.6, 9.0, "warn")
         if tracker.proven:
             # Name the minion that proved each tribe, so the call is checkable.
-            tribes = " · ".join(
-                f"{t.title()} ({tracker.witness.get(t, '?')})"
-                for t in sorted(tracker.proven))
-            suffix = "" if tracker.complete else "  +learning"
-            label(f"tribes: {tribes}{suffix}"[:96], 14.0, 24.0, "dim")
+            parts = [f"{t.title()} ({tracker.witness.get(t, '?')})"
+                     for t in sorted(tracker.proven)]
+            if not tracker.complete:
+                parts.append("+learning")
+            half = (len(parts) + 1) // 2      # two lines: one line overflowed
+            label("tribes: " + " · ".join(parts[:half]), 14.0, 23.0, "dim")
+            if parts[half:]:
+                label("        " + " · ".join(parts[half:]), 14.0, 37.0, "dim")
         else:
-            label("tribes: learning from the shop…", 14.0, 24.0, "dim")
+            label("tribes: learning from the shop…", 14.0, 23.0, "dim")
         if not targets:
             label("no viable build yet", 14.0, 42.0, "dim")
             return
 
-        y = 44.0
-        for fit, cards in targets:
-            label(f"{fit.comp.name} ({fit.comp.power_level})", 14.0, y, "sub")
-            label(fit.describe(), 190.0, y, "dim")
-            top = y + 15.0
-            x = 14.0
+        # One line per build; the cards appear for whichever one you point at.
+        y = ROWS_TOP
+        for i, (fit, cards) in enumerate(targets):
+            hot = (i == self.hover_row)
+            if hot:
+                C.colorWithRed_green_blue_alpha_(1, 1, 1, 0.09).set()
+                AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    ((8.0, y - 3), (self.bounds().size.width - 16.0, TITLE_H)), 4, 4).fill()
+            label(f"{'▸' if hot else ' '} {fit.comp.name} ({fit.comp.power_level})",
+                  12.0, y, "good" if hot else "sub")
+            label(fit.describe(), 210.0, y, "dim")
+            y += TITLE_H
+
+        if self.hover_row < 0 or self.hover_row >= len(targets):
+            label("point at a build to see its cards", 14.0, y + 8.0, "dim")
+            return
+
+        fit, cards = targets[self.hover_row]
+        top = y + 12.0
+        x = 14.0
+        if True:
             for card_id, role, owned in cards:
                 img = self.image_for(card_id)
                 frame = ((x, top), (CARD_W, CARD_H))
@@ -342,8 +373,9 @@ class BoardView(AppKit.NSView):
                 if len(name) > 12:
                     name = name[:11] + "…"
                 label(name, x + 1, top + CARD_H + 3, "cardhave" if owned else "cardname")
+                label("HAVE" if owned else role.title(), x + 1, top + CARD_H + 15,
+                      "cardhave" if owned else "cardrole")
                 x += CARD_W + CARD_GAP
-            y += ROW_H
 
 
 class Overlay(AppKit.NSObject):
@@ -368,7 +400,7 @@ class Overlay(AppKit.NSObject):
         self.window.orderFrontRegardless()
 
         board_w = 14.0 * 2 + BOARD_MAX * (CARD_W + CARD_GAP)
-        board_h = 52.0 + BOARDS * ROW_H
+        board_h = ROWS_TOP + BOARDS * TITLE_H + CARD_H + 46.0
         self.board_window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             ((0, 0), (board_w, board_h)), style, AppKit.NSBackingStoreBuffered, False
         )
@@ -388,7 +420,14 @@ class Overlay(AppKit.NSObject):
         self.board_w, self.board_h = board_w, board_h
         return self
 
+    def toggle_hidden(self) -> None:
+        self.hidden = not getattr(self, "hidden", False)
+
     def tick_(self, _timer):
+        if getattr(self, "hidden", False):
+            for w in (self.window, self.board_window):
+                w.orderOut_(None)
+            return
         lines = self.model.lines()
         height = 24.0 + sum(6 if not t else STYLES[s][0] + 5 for t, s in lines)
         b = hearthstone_bounds()
@@ -413,6 +452,14 @@ class Overlay(AppKit.NSObject):
         else:
             bx, by = MARGIN, MARGIN
         self.board_window.setFrame_display_(((bx, by), (self.board_w, bh)), True)
+        # The panels are click-through, so mouse events never reach them --
+        # poll the cursor instead. Reading the location needs no permission.
+        loc = AppKit.NSEvent.mouseLocation()
+        inside = (bx <= loc.x <= bx + self.board_w and by <= loc.y <= by + bh)
+        self.board_view.hover_row = (
+            self.board_view.row_at((loc.x - bx, by + bh - loc.y)) if inside else -1)
+        self.board_window.orderFrontRegardless()
+        self.window.orderFrontRegardless()
         self.board_view.setNeedsDisplay_(True)
 
 
@@ -426,7 +473,11 @@ def main():
     AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.25, overlay, "tick:", None, True
     )
+    # kill -USR1 <pid> toggles both panels; no global hotkey, which would need
+    # Input Monitoring permission.
+    signal.signal(signal.SIGUSR1, lambda *_: overlay.toggle_hidden())
     print("overlay running — Ctrl-C to quit")
+    print("hide/show:  pkill -USR1 -f tools/overlay.py")
     try:
         AppHelper.runEventLoop()
     except KeyboardInterrupt:
