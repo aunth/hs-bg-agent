@@ -27,6 +27,7 @@ from PyObjCTools import AppHelper  # noqa: E402
 from hsbg import parser as P  # noqa: E402
 from hsbg.carddb import CardDB  # noqa: E402
 from hsbg.state import BGState, EntityStore  # noqa: E402
+from hsbg.stats import BGStats  # noqa: E402
 from hsbg.tail import PowerLogFollower  # noqa: E402
 
 PANEL_W, MARGIN = 330.0, 18.0
@@ -61,6 +62,7 @@ class Model:
         self.lock = threading.Lock()
         self.store = EntityStore()
         self.bg = BGState(self.store, CardDB())
+        self.stats = BGStats()
         self.choice = None
         self.action = None
         self.action_at = 0.0
@@ -104,15 +106,34 @@ class Model:
                 kind = "HERO PICK" if choice.choice_type == "MULLIGAN" else "DISCOVER"
                 out.append(("", "dim"))
                 out.append((kind, "sub"))
-                for i, r in enumerate(choice.entities, 1):
+                ranked = []
+                for r in choice.entities:
                     nm = (bg.cards.name(r.card_id) if bg.cards else "") or r.name or r.card_id
-                    out.append((f"{i}. {nm}", "body"))
+                    hs = self.stats.hero(r.card_id)
+                    ranked.append((hs.avg_position if hs else 99.0, nm, hs))
+                best = min((p for p, _, _ in ranked), default=99.0)
+                for i, (pos, nm, hs) in enumerate(sorted(ranked), 1):
+                    tick = "★ " if hs and pos == best else "  "
+                    out.append((f"{tick}{nm}", "good" if tick.strip() else "body"))
+                    if hs:
+                        out.append((f"     avg {hs.avg_position:.2f}   "
+                                    f"picked {hs.pick_rate:.0f}%   {hs.games} games", "dim"))
+                    else:
+                        out.append(("     no stats", "dim"))
             out.append(("", "dim"))
             out.append((f"SHOP ({len(bg.shop)})", "sub"))
             for i, m in enumerate(bg.shop, 1):
                 mark = "~" if m.frozen else " "
-                out.append((f"{i}.{mark}{m.name}", "body"))
-                out.append((f"    {m.atk}/{m.health}  t{m.tier}  {m.tribe or '—'}", "dim"))
+                cs = self.stats.card(m.card_id)
+                style = "body"
+                if cs:
+                    style = "good" if cs.impact > 0.10 else ("bad" if cs.impact < -0.10 else "body")
+                out.append((f"{i}.{mark}{m.name}", style))
+                meta = f"    {m.atk}/{m.health}  t{m.tier}  {m.tribe or '—'}"
+                if cs:
+                    sign = "+" if cs.impact >= 0 else ""
+                    meta += f"   {cs.avg_placement:.2f}  {sign}{cs.impact:.2f}"
+                out.append((meta, "dim"))
             if not bg.shop:
                 out.append(("  (empty)", "dim"))
             out.append(("", "dim"))
@@ -131,6 +152,8 @@ STYLES = {
     "sub":  (11.0, AppKit.NSFontWeightBold, C.colorWithRed_green_blue_alpha_(0.6, 0.65, 0.72, 1.0)),
     "body": (13.0, AppKit.NSFontWeightRegular, C.colorWithRed_green_blue_alpha_(0.96, 0.96, 0.97, 1.0)),
     "dim":  (11.0, AppKit.NSFontWeightRegular, C.colorWithRed_green_blue_alpha_(0.58, 0.60, 0.66, 1.0)),
+    "good": (13.0, AppKit.NSFontWeightSemibold, C.colorWithRed_green_blue_alpha_(0.45, 0.90, 0.55, 1.0)),
+    "bad":  (13.0, AppKit.NSFontWeightRegular, C.colorWithRed_green_blue_alpha_(0.95, 0.50, 0.45, 1.0)),
 }
 
 

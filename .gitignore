@@ -7,3 +7,4 @@ venv/
 .DS_Store
 data/cards.json
 .venv/
+data/stats/
