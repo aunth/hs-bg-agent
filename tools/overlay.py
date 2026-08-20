@@ -74,11 +74,18 @@ class Model:
     def run(self):
         follower = PowerLogFollower()
         while True:
-            events = follower.poll()
+            try:
+                events = follower.poll()
+            except Exception as exc:            # never let the reader die silently
+                print(f"reader error: {exc!r}", flush=True)
+                time.sleep(1.0)
+                continue
             if events:
                 with self.lock:
                     for ev in events:
                         self.store.apply(ev)
+                        if isinstance(ev, P.CreateGame):
+                            self.choice, self.action = None, None
                         if isinstance(ev, P.ChoiceOffered):
                             self.choice = ev
                         elif isinstance(ev, P.ChoiceMade):
@@ -95,12 +102,29 @@ class Model:
         """(text, style) pairs for the panel."""
         with self.lock:
             bg, choice = self.bg, self.choice
-            live = (time.time() - self.last_data) < 3.0
+            age = time.time() - self.last_data if self.last_data else None
+            live = age is not None and age < 3.0
+            # Beyond this the board on screen is history, not the live game.
+            stale = age is None or age > 45
             action = self.action if (time.time() - self.action_at) < 6.0 else None
-            out = [(f"BATTLEGROUNDS   {'● live' if live else '○ idle'}", "head")]
+            def ago(sec):
+                return f"{int(sec)}s" if sec < 90 else f"{int(sec // 60)}m"
+
+            flag = "● live" if live else (f"○ {ago(age)} old" if age else "○ waiting")
+            out = [(f"BATTLEGROUNDS   {flag}", "head")]
             if not self.session:
                 out.append(("waiting for a match…", "dim"))
                 return out
+            if stale:
+                # Say plainly that this is not current, and why we think so.
+                out.append(("", "dim"))
+                out.append(("NO LIVE DATA", "warn"))
+                out.append((f"  last log write {ago(age)} ago" if age else "  no log yet", "dim"))
+                out.append(("  board below is the last game,", "dim"))
+                out.append(("  not the current one.", "dim"))
+                out.append(("  if you are mid-game, Hearthstone", "dim"))
+                out.append(("  has stopped writing logs —", "dim"))
+                out.append(("  restart the client.", "dim"))
             out.append((f"turn {bg.turn}    tier {bg.tier}    gold {bg.gold}", "stat"))
             if action:
                 out.append((f"↳ {action}", "dim"))
@@ -166,6 +190,7 @@ STYLES = {
     "dim":  (11.0, AppKit.NSFontWeightRegular, C.colorWithRed_green_blue_alpha_(0.58, 0.60, 0.66, 1.0)),
     "good": (13.0, AppKit.NSFontWeightSemibold, C.colorWithRed_green_blue_alpha_(0.45, 0.90, 0.55, 1.0)),
     "bad":  (13.0, AppKit.NSFontWeightRegular, C.colorWithRed_green_blue_alpha_(0.95, 0.50, 0.45, 1.0)),
+    "warn": (12.0, AppKit.NSFontWeightBold, C.colorWithRed_green_blue_alpha_(1.0, 0.62, 0.25, 1.0)),
 }
 
 
