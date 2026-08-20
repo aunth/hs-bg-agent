@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from hsbg import parser as P  # noqa: E402
+from hsbg.carddb import CardDB  # noqa: E402
 from hsbg.state import BGState, EntityStore  # noqa: E402
 
 BUTTONS = {
@@ -52,7 +53,7 @@ def main() -> int:
         path = caps[-1]
 
     store = EntityStore()
-    bg = BGState(store)
+    bg = BGState(store, CardDB())
     last_shop = None
     heroes_shown = False
     n_events = 0

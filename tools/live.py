@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from hsbg import parser as P  # noqa: E402
+from hsbg.carddb import CardDB  # noqa: E402
 from hsbg.state import BGState, EntityStore  # noqa: E402
 from hsbg.tail import LOGS_DIR, PowerLogFollower  # noqa: E402
 
@@ -81,7 +82,7 @@ def main() -> int:
     args = ap.parse_args()
 
     store = EntityStore()
-    bg = BGState(store)
+    bg = BGState(store, CardDB())
     follower = PowerLogFollower(args.logs)
     last_action, last_action_at, dirty, connected = None, 0.0, True, False
     choice = None

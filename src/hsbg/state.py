@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from . import parser as P
+from .carddb import CardDB
 
 
 @dataclass
@@ -141,18 +142,32 @@ class Minion:
     pos: int
     frozen: bool = False
     golden: bool = False
+    tribe: str = ""
 
     def __str__(self) -> str:
         label = self.name or self.card_id
         flags = "".join(f for f, on in (("*", self.golden), ("~", self.frozen)) if on)
-        return f"{label}{flags} {self.atk}/{self.health} (t{self.tier})"
+        tribe = f" [{self.tribe}]" if self.tribe else ""
+        return f"{label}{flags} {self.atk}/{self.health} (t{self.tier}){tribe}"
 
 
 class BGState:
     """A read-only view over an EntityStore, projected for Battlegrounds."""
 
-    def __init__(self, store: EntityStore) -> None:
+    def __init__(self, store: EntityStore, cards: CardDB | None = None) -> None:
         self.s = store
+        self.cards = cards
+
+    def _card_name(self, entity) -> tuple[str, int, str]:
+        """Resolve display name, tier and tribe, preferring the card database.
+
+        The log only prints an entity's name when it happens to emit a bracketed
+        reference for it, so the database is the reliable source.
+        """
+        card = self.cards.by_id(entity.card_id) if self.cards else None
+        name = (card.name if card else "") or entity.tag("_name", "") or entity.card_id
+        tier = entity.int_tag("TECH_LEVEL") or (card.tier if card else 0)
+        return name, tier, (card.tribe if card else "")
 
     def _minions(self, controller: int | None) -> list[Minion]:
         if controller is None:
@@ -163,17 +178,19 @@ class BGState:
                 continue
             if e.int_tag("CONTROLLER", -1) != controller:
                 continue
+            name, tier, tribe = self._card_name(e)
             out.append(
                 Minion(
                     id=e.id,
                     card_id=e.card_id,
-                    name=e.tag("_name", ""),
+                    name=name,
                     atk=e.int_tag("ATK"),
                     health=e.int_tag("HEALTH"),
-                    tier=e.int_tag("TECH_LEVEL"),
+                    tier=tier,
                     pos=e.int_tag("ZONE_POSITION"),
                     frozen=e.int_tag("FROZEN") == 1,
                     golden=e.int_tag("PREMIUM") == 1,
+                    tribe=tribe,
                 )
             )
         return sorted(out, key=lambda m: m.pos)
@@ -193,14 +210,14 @@ class BGState:
         me = self.s.local_player
         if not me:
             return []
-        return [
-            Minion(
-                e.id, e.card_id, e.tag("_name", ""), e.int_tag("ATK"),
-                e.int_tag("HEALTH"), e.int_tag("TECH_LEVEL"), e.int_tag("ZONE_POSITION"),
-            )
-            for e in self.s.entities.values()
-            if e.tag("ZONE") == "HAND" and e.int_tag("CONTROLLER", -1) == me.player_id
-        ]
+        out = []
+        for e in self.s.entities.values():
+            if e.tag("ZONE") != "HAND" or e.int_tag("CONTROLLER", -1) != me.player_id:
+                continue
+            name, tier, tribe = self._card_name(e)
+            out.append(Minion(e.id, e.card_id, name, e.int_tag("ATK"), e.int_tag("HEALTH"),
+                              tier, e.int_tag("ZONE_POSITION"), tribe=tribe))
+        return out
 
     def _my_tags(self) -> dict[str, str]:
         me = self.s.local_player
