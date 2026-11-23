@@ -223,6 +223,22 @@ class BGState:
         me = self.s.local_player
         return self.s.player_tags(me.player_id) if me else {}
 
+    def _hero_entity(self) -> Entity | None:
+        """The local player's actual equipped hero.
+
+        HERO_ENTITY names its id but, like RESOURCES/PLAYER_TECH_LEVEL,
+        arrives keyed by battletag rather than a resolvable entity ref -- see
+        the module docstring and player_tags() -- so it comes from the same
+        merged tag source as gold/tier, not a direct id lookup.
+        """
+        hid = self._my_tags().get("HERO_ENTITY")
+        if not hid:
+            return None
+        try:
+            return self.s.entities.get(int(hid))
+        except (TypeError, ValueError):
+            return None
+
     @property
     def gold(self) -> int:
         """Gold flickers 0->N as the client resyncs; this is the settled value."""
@@ -261,6 +277,38 @@ class BGState:
     @property
     def max_gold(self) -> int:
         return min(10, self.turn + 2) if self.turn else 0
+
+    @property
+    def hero_card_id(self) -> str:
+        hero = self._hero_entity()
+        return hero.card_id if hero else ""
+
+    @property
+    def hero_health(self) -> int:
+        """Remaining hero health, before armor. 0 before a hero is equipped."""
+        hero = self._hero_entity()
+        return max(0, hero.int_tag("HEALTH") - hero.int_tag("DAMAGE")) if hero else 0
+
+    @property
+    def hero_armor(self) -> int:
+        hero = self._hero_entity()
+        return hero.int_tag("ARMOR") if hero else 0
+
+    @property
+    def leaderboard_place(self) -> int:
+        """1-8, Blizzard's own live rank -- already accounts for every real
+        player's true health, which is why it beats anything derived locally.
+        0 if unknown (e.g. before turn 1)."""
+        hero = self._hero_entity()
+        return hero.int_tag("PLAYER_LEADERBOARD_PLACE") if hero else 0
+
+    @property
+    def damage_last_turn(self) -> int:
+        """Damage taken in the most recently resolved combat."""
+        try:
+            return int(self._my_tags().get("DAMAGE_DEALT_TO_HERO_LAST_TURN", 0))
+        except ValueError:
+            return 0
 
     @property
     def hero_offers(self) -> list[Entity]:

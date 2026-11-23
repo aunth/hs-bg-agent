@@ -19,12 +19,16 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 BASE = "https://static.zerotoheroes.com/api/bgs"
+# Skinned heroes log a suffixed cardId (e.g. BG21_HERO_010_SKIN_C) that never
+# appears in Firestone's data -- it only ever keys the base hero id.
+_SKIN_SUFFIX = re.compile(r"_SKIN_[A-Z0-9]+$")
 COMPS_URL = ("https://static.zerotoheroes.com/hearthstone/data/"
              "battlegrounds-strategies/bgs-comps-strategies.gz.json")
 UA = "hs-bg-agent/0.1 (personal Battlegrounds advisor)"
@@ -40,6 +44,11 @@ class HeroStat:
     conservative: float
     pick_rate: float          # of the times offered, how often taken
     tribe_stats: list = field(default_factory=list)
+    # turn -> population-average total board stats (atk+health) for this hero.
+    # A real external "expected board power at turn N" benchmark.
+    warband_stats: dict[int, float] = field(default_factory=dict)
+    # turn -> population combat win rate for this hero.
+    combat_winrate: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -134,6 +143,12 @@ class BGStats:
                     conservative=h.get("conservativePositionEstimate", 0.0),
                     pick_rate=(h.get("totalPicked", 0) / offered * 100) if offered else 0.0,
                     tribe_stats=h.get("tribeStats") or [],
+                    warband_stats={t["turn"]: t["averageStats"]
+                                   for t in (h.get("warbandStats") or [])
+                                   if t.get("averageStats")},
+                    combat_winrate={t["turn"]: t["winrate"]
+                                    for t in (h.get("combatWinrate") or [])
+                                    if t.get("winrate") is not None},
                 )
         cp = self._path("card-stats")
         if cp.exists():
@@ -186,7 +201,8 @@ class BGStats:
         return bool(self.heroes or self.cards)
 
     def hero(self, card_id: str) -> HeroStat | None:
-        return self.heroes.get(card_id)
+        """Look up by base hero id -- a skinned hero's own cardId never matches."""
+        return self.heroes.get(card_id) or self.heroes.get(_SKIN_SUFFIX.sub("", card_id))
 
     def card(self, card_id: str) -> CardStat | None:
         return self.cards.get(card_id)

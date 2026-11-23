@@ -38,12 +38,31 @@ CARD_W, CARD_H, CARD_GAP = 72.0, 109.0, 6.0     # 256x388 rendered card, scaled
 BOARDS, TITLE_H = 3, 19.0                       # builds listed, row height
 ROWS_TOP = 58.0                                 # header is three lines
 BOARD_MAX = 7
+STALE_AFTER = 45.0                              # seconds of silence before data reads as history
 BUTTONS = {
     "TB_BaconShop_DragBuy": "BUY", "TB_BaconShop_DragBuy_Spell": "BUY SPELL",
     "TB_BaconShop_DragSell": "SELL", "TB_BaconShop_8p_Reroll_Button": "REROLL",
     "TB_BaconShopLockAll_Button": "FREEZE",
     "TB_BaconShopTechUp02_Button": "UPGRADE", "TB_BaconShopTechUp03_Button": "UPGRADE",
 }
+
+
+def _cover_source(image_size, frame_w: float, frame_h: float):
+    """Centered crop of ``image_size`` matching the frame's aspect ratio.
+
+    Used as the source rect for drawInRect_fromRect_..., so a differently-
+    shaped source image (square bare art vs. tall framed render) fills the
+    frame without being stretched out of proportion.
+    """
+    iw, ih = image_size.width, image_size.height
+    if not iw or not ih:
+        return AppKit.NSZeroRect
+    img_aspect, frame_aspect = iw / ih, frame_w / frame_h
+    if img_aspect > frame_aspect:
+        w = ih * frame_aspect
+        return ((iw - w) / 2.0, 0.0), (w, ih)
+    h = iw / frame_aspect
+    return (0.0, (ih - h) / 2.0), (iw, h)
 
 
 def hearthstone_bounds():
@@ -87,14 +106,15 @@ class Model:
                 print(f"reader error: {exc!r}", flush=True)
                 time.sleep(1.0)
                 continue
-            if events:
-                with self.lock:
+            with self.lock:
+                if events:
                     for ev in events:
                         self.store.apply(ev)
                         if isinstance(ev, P.CreateGame):
                             self.choice, self.action = None, None
                             # Each lobby has its own tribe slate and mode.
                             self.advisor.tracker.reset()
+                            self.advisor.combat_history.reset()
                         if isinstance(ev, P.ChoiceOffered):
                             self.choice = ev
                         elif isinstance(ev, P.ChoiceMade):
@@ -104,18 +124,35 @@ class Model:
                             if label:
                                 self.action, self.action_at = label, time.time()
                     self.session = follower.session
-                    self.last_data = time.time()
+                # The log's own write time, not "when we last read something" --
+                # a fresh reader catching up on an already-stale file must not
+                # look live just because *we* just read it. See tail.py.
+                if follower.log_mtime:
+                    self.last_data = follower.log_mtime
             time.sleep(0.12)
+
+    def has_live_data(self) -> bool:
+        """False before a match has ever been seen, or once its data goes stale.
+
+        Guards the builds panel: with no game running, no tribe has been ruled
+        out yet, so every comp still reads as merely "unconfirmed" rather than
+        absent -- showing them at the main menu is noise, not advice.
+        """
+        with self.lock:
+            if not self.session or not self.last_data:
+                return False
+            return (time.time() - self.last_data) <= STALE_AFTER
 
     def targets(self, limit: int = BOARDS):
         """[(fit, [(card_id, role, owned)])] for the most plausible builds.
 
-        Builds whose tribe is not in this lobby are dropped entirely -- they are
-        not options, so showing them would be noise.
+        Only builds whose tribe is *confirmed* present (or need no tribe at
+        all) are shown -- a merely "unconfirmed" tribe is not yet evidence for
+        anything, so surfacing it is a guess dressed up as advice.
         """
         with self.lock:
             bg = self.bg
-            if not self.stats.comps:
+            if not self.stats.comps or not self.session:
                 return []
             owned = {m.card_id for m in bg.board} | {m.card_id for m in bg.hand}
             tribes: dict[str, int] = {}
@@ -124,7 +161,7 @@ class Model:
                 for r in (card.races if card else ()):
                     tribes[r] = tribes.get(r, 0) + 1
             fits = [f for f in self.advisor.comp_fits(list(owned), tribes, len(bg.board))
-                    if f.available]
+                    if f.availability == "active"]
             order = {"CORE": 0, "ADDON": 1, "CYCLE": 2}
             out = []
             for fit in fits[:limit]:
@@ -140,7 +177,7 @@ class Model:
             age = time.time() - self.last_data if self.last_data else None
             live = age is not None and age < 3.0
             # Beyond this the board on screen is history, not the live game.
-            stale = age is None or age > 45
+            stale = age is None or age > STALE_AFTER
             action = self.action if (time.time() - self.action_at) < 6.0 else None
             def ago(sec):
                 return f"{int(sec)}s" if sec < 90 else f"{int(sec // 60)}m"
@@ -206,13 +243,21 @@ class Model:
                 out.append((f"{i}. {m.name}  {m.atk}/{m.health}", "body"))
             if not bg.board:
                 out.append(("  (empty)", "dim"))
-            live_fits = [f for f in fits if f.affinity > 0][:3] if bg.shop else []
+            live_fits = ([f for f in fits if f.affinity > 0 and f.available][:3]
+                         if bg.shop else [])
             if live_fits:
                 out.append(("", "dim"))
                 out.append(("BUILDING TOWARD", "sub"))
                 for f in live_fits:
                     out.append((f"  {f.comp.name}  ({f.comp.power_level})", "body"))
                     out.append((f"    {f.describe()}", "dim"))
+            advice = self.advisor.pivot_check(bg, fits) if bg.shop else None
+            if advice:
+                out.append(("", "dim"))
+                out.append(("PIVOT CHECK", "sub"))
+                out.append((f"  {advice.comp.name}  ({advice.comp.power_level})", "body"))
+                out.append((f"    {advice.describe()}", "dim"))
+                out.append((f"    {advice.verdict}", "dim"))
             return out
 
 
@@ -317,6 +362,8 @@ class BoardView(AppKit.NSView):
                   20.0 + len(title) * 7.6, 9.0, "warn")
         if tracker.proven:
             # Name the minion that proved each tribe, so the call is checkable.
+            # Only tribes actually confirmed appear here -- nothing is listed
+            # on a guess.
             parts = [f"{t.title()} ({tracker.witness.get(t, '?')})"
                      for t in sorted(tracker.proven)]
             if not tracker.complete:
@@ -325,8 +372,6 @@ class BoardView(AppKit.NSView):
             label("tribes: " + " · ".join(parts[:half]), 14.0, 23.0, "dim")
             if parts[half:]:
                 label("        " + " · ".join(parts[half:]), 14.0, 37.0, "dim")
-        else:
-            label("tribes: learning from the shop…", 14.0, 23.0, "dim")
         if not targets:
             label("no viable build yet", 14.0, 42.0, "dim")
             return
@@ -348,34 +393,61 @@ class BoardView(AppKit.NSView):
             label("point at a build to see its cards", 14.0, y + 8.0, "dim")
             return
 
+        def draw_card(card_id, frame, owned, name):
+            """Draw one card so it reads as a card, whatever image we have.
+
+            The art cache mixes two very different assets: a full framed
+            render (rare for Battlegrounds cards) and bare square artwork
+            (the common case). Used as-is, that made half the row look like
+            real cards and the other half like cropped photos. Baking the
+            same clipped shape, name plate and border onto every image --
+            regardless of which source it came from -- makes them all read
+            as one consistent "card" rather than a naming lottery.
+            """
+            img = self.image_for(card_id)
+            path = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(frame, 6, 6)
+            if img:
+                ctx = AppKit.NSGraphicsContext.currentContext()
+                ctx.saveGraphicsState()
+                path.addClip()
+                source = _cover_source(img.size(), CARD_W, CARD_H)
+                img.drawInRect_fromRect_operation_fraction_respectFlipped_hints_(
+                    frame, source, AppKit.NSCompositingOperationSourceOver,
+                    1.0 if owned else 0.40, True,
+                    {AppKit.NSImageHintInterpolation: AppKit.NSImageInterpolationHigh})
+                ctx.restoreGraphicsState()
+            else:
+                C.colorWithRed_green_blue_alpha_(1, 1, 1, 0.06).set()
+                path.fill()
+
+            # A name plate baked onto the card itself, like the genuine
+            # article, instead of a caption floating underneath it.
+            (fx, fy), (fw, fh) = frame
+            plate_h = 16.0
+            C.colorWithRed_green_blue_alpha_(0.03, 0.03, 0.05, 0.85).set()
+            AppKit.NSBezierPath.bezierPathWithRect_(
+                ((fx, fy + fh - plate_h), (fw, plate_h))).fill()
+            disp = name if len(name) <= 13 else name[:12] + "…"
+            label(disp, fx + 3, fy + fh - plate_h + 3, "cardhave" if owned else "cardname")
+
+            # Gold border for cards you already hold, bronze otherwise --
+            # mirrors Hearthstone's own "you have this" treatment.
+            border = (C.colorWithRed_green_blue_alpha_(0.45, 0.90, 0.55, 0.95) if owned
+                      else C.colorWithRed_green_blue_alpha_(0.55, 0.42, 0.22, 0.9))
+            border.set()
+            path.setLineWidth_(2.0 if owned else 1.2)
+            path.stroke()
+
         fit, cards = targets[self.hover_row]
         top = y + 12.0
         x = 14.0
-        if True:
-            for card_id, role, owned in cards:
-                img = self.image_for(card_id)
-                frame = ((x, top), (CARD_W, CARD_H))
-                if img:
-                    # Cards you already hold stay bright; the rest are dimmed.
-                    img.drawInRect_fromRect_operation_fraction_respectFlipped_hints_(
-                        frame, AppKit.NSZeroRect, AppKit.NSCompositingOperationSourceOver,
-                        1.0 if owned else 0.40, True, None)
-                else:
-                    C.colorWithRed_green_blue_alpha_(1, 1, 1, 0.06).set()
-                    AppKit.NSBezierPath.bezierPathWithRect_(frame).fill()
-                if owned:
-                    C.colorWithRed_green_blue_alpha_(0.45, 0.90, 0.55, 0.95).set()
-                    ring = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                        frame, 4, 4)
-                    ring.setLineWidth_(2.0)
-                    ring.stroke()
-                name = (self.model.bg.cards.name(card_id) if self.model.bg.cards else card_id)
-                if len(name) > 12:
-                    name = name[:11] + "…"
-                label(name, x + 1, top + CARD_H + 3, "cardhave" if owned else "cardname")
-                label("HAVE" if owned else role.title(), x + 1, top + CARD_H + 15,
-                      "cardhave" if owned else "cardrole")
-                x += CARD_W + CARD_GAP
+        for card_id, role, owned in cards:
+            frame = ((x, top), (CARD_W, CARD_H))
+            name = (self.model.bg.cards.name(card_id) if self.model.bg.cards else card_id)
+            draw_card(card_id, frame, owned, name)
+            label("HAVE" if owned else role.title(), x + 1, top + CARD_H + 3,
+                  "cardhave" if owned else "cardrole")
+            x += CARD_W + CARD_GAP
 
 
 class Overlay(AppKit.NSObject):
@@ -423,6 +495,10 @@ class Overlay(AppKit.NSObject):
     def toggle_hidden(self) -> None:
         self.hidden = not getattr(self, "hidden", False)
 
+    def toggle_board_hidden(self) -> None:
+        """Hide/show just the builds panel, independent of the main one."""
+        self.board_hidden = not getattr(self, "board_hidden", False)
+
     def tick_(self, _timer):
         if getattr(self, "hidden", False):
             for w in (self.window, self.board_window):
@@ -444,6 +520,16 @@ class Overlay(AppKit.NSObject):
             x, y = MARGIN, MARGIN
         self.window.setFrame_display_(((x, y), (PANEL_W, height)), True)
         self.view.setNeedsDisplay_(True)
+        self.window.orderFrontRegardless()
+
+        # The builds panel only has anything real to say once a match is live
+        # -- otherwise every comp reads as merely "unconfirmed", not absent,
+        # and would show up as noise. Also foldable on its own, independent of
+        # the main panel above.
+        show_board = not getattr(self, "board_hidden", False) and self.model.has_live_data()
+        if not show_board:
+            self.board_window.orderOut_(None)
+            return
         # Target board sits along the bottom of the game window.
         bh = self.board_h
         if b:
@@ -459,7 +545,6 @@ class Overlay(AppKit.NSObject):
         self.board_view.hover_row = (
             self.board_view.row_at((loc.x - bx, by + bh - loc.y)) if inside else -1)
         self.board_window.orderFrontRegardless()
-        self.window.orderFrontRegardless()
         self.board_view.setNeedsDisplay_(True)
 
 
@@ -473,11 +558,13 @@ def main():
     AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.25, overlay, "tick:", None, True
     )
-    # kill -USR1 <pid> toggles both panels; no global hotkey, which would need
+    # kill -USR1/-USR2 <pid> toggle panels; no global hotkey, which would need
     # Input Monitoring permission.
     signal.signal(signal.SIGUSR1, lambda *_: overlay.toggle_hidden())
+    signal.signal(signal.SIGUSR2, lambda *_: overlay.toggle_board_hidden())
     print("overlay running — Ctrl-C to quit")
-    print("hide/show:  pkill -USR1 -f tools/overlay.py")
+    print("hide/show everything:   pkill -USR1 -f tools/overlay.py")
+    print("hide/show builds panel: pkill -USR2 -f tools/overlay.py")
     try:
         AppHelper.runEventLoop()
     except KeyboardInterrupt:

@@ -5,10 +5,13 @@ Two problems this solves beyond a plain ``tail -f``:
 * Hearthstone opens a **new** ``Logs/Hearthstone_<timestamp>/`` directory on
   every launch, so the file to follow changes when the game restarts.
 * Events arrive mid-block. A ``FULL_ENTITY`` line is followed by its ``tag=``
+  lines, or a ``DebugPrintEntityChoices`` header by its ``Entities[n]=``
   lines, and a read can land between them. Parsing an incomplete block would
-  emit the entity without its tags and then orphan the rest, so the trailing
-  run is held back until either a new non-tag line arrives or the log goes
-  quiet (``idle_flush``).
+  emit it short and then orphan the rest -- the parser has no open block left
+  to attach a continuation line to once its header has already been flushed
+  as a separate read, so those lines are just silently dropped. The trailing
+  run is held back until either a new, non-continuation line arrives or the
+  log goes quiet (``idle_flush``).
 """
 from __future__ import annotations
 
@@ -19,7 +22,16 @@ from pathlib import Path
 from . import parser as P
 
 LOGS_DIR = Path("/Applications/Hearthstone/Logs")
-_TAG_LINE = re.compile(r"GameState\.DebugPrintPower\(\) -\s+tag=")
+# Lines that only make sense attached to the header above them: a tag= line
+# under FULL_ENTITY/SHOW_ENTITY/etc, or an Entities[n]= line under a
+# DebugPrintEntityChoices/DebugPrintEntitiesChosen header (hero picks,
+# Discover). Missing the second form dropped choice options at random --
+# whichever entities landed in the next read had no pending choice left to
+# join, since each read is parsed fresh.
+_CONTINUATION_LINE = re.compile(
+    r"GameState\.DebugPrintPower\(\) -\s+tag=|"
+    r"GameState\.DebugPrintEntit(?:yChoices|iesChosen)\(\) -\s+Entities\[\d+\]="
+)
 
 
 def newest_session(logs_dir: Path = LOGS_DIR) -> Path | None:
@@ -34,6 +46,12 @@ class PowerLogFollower:
         self.logs_dir = logs_dir
         self.idle_flush = idle_flush
         self.session: Path | None = None
+        # The file's own mtime -- when Hearthstone actually last wrote to it.
+        # Deliberately not "when we last read something": a fresh reader
+        # attaching to an already-stale file (e.g. the overlay was restarted)
+        # would otherwise read the whole backlog in one go and that catch-up
+        # would look indistinguishable from genuinely live data.
+        self.log_mtime: float = 0.0
         self._fh = None
         self._inode = None
         self._partial = ""
@@ -62,6 +80,10 @@ class PowerLogFollower:
         power = s / "Power.log"
         if not power.exists():
             return False
+        try:
+            self.log_mtime = power.stat().st_mtime
+        except OSError:
+            pass
         if s != self.session or self._fh is None:
             if self._open(power):
                 self.session = s
@@ -110,7 +132,7 @@ class PowerLogFollower:
         else:
             cut = 0
             for i in range(len(self._buffer) - 1, -1, -1):
-                if not _TAG_LINE.search(self._buffer[i]):
+                if not _CONTINUATION_LINE.search(self._buffer[i]):
                     cut = i
                     break
             if cut == 0:

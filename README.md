@@ -26,7 +26,8 @@ tools/capture.sh                          # snapshot a session's logs
 tools/replay.py [capture/Power.log]       # replay one, print state transitions
 tools/live.py                             # live state in the terminal
 .venv/bin/python tools/overlay.py         # live state as an in-game overlay
-pkill -USR1 -f tools/overlay.py           # hide/show the overlay
+pkill -USR1 -f tools/overlay.py           # hide/show everything
+pkill -USR2 -f tools/overlay.py           # hide/show just the builds panel
 pkill -f tools/overlay.py                 # quit it
 ```
 

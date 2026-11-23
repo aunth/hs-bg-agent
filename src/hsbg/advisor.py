@@ -21,9 +21,14 @@ from .stats import BGStats, Comp
 
 ROLE_WEIGHT = {"CORE": 1.0, "ADDON": 0.7, "CYCLE": 0.4}
 
-# Battlegrounds runs a subset of tribes per lobby. Recommending a build around a
-# tribe that is not in the game is worse than no advice at all.
-TRIBES_PER_GAME = 5
+# Battlegrounds runs a subset of tribes per lobby, and how many is not fixed --
+# it has changed across patches and is not worth hardcoding. So instead of
+# waiting to prove a specific count, we watch for the slate to go quiet: once
+# several turns pass with no newly-proven tribe, whatever hasn't shown up is
+# treated as absent. Recommending a build around a tribe that is not in the
+# game is worse than no advice at all.
+MIN_TURN = 5           # too little shop evidence before this to conclude anything
+STAGNATION_TURNS = 4    # turns of no new tribe evidence before we call the slate settled
 
 
 class TribeTracker:
@@ -41,14 +46,19 @@ class TribeTracker:
         self.witness: dict[str, str] = {}
         # Duos runs its own card pool and meta; our stats are solo Battlegrounds.
         self.duos = False
+        self.turn = 0
+        self.last_new_turn = 0
 
     def reset(self) -> None:
         self.proven.clear()
         self.ambiguous.clear()
         self.witness.clear()
         self.duos = False
+        self.turn = 0
+        self.last_new_turn = 0
 
-    def observe(self, cards: CardDB, minions) -> None:
+    def observe(self, cards: CardDB, minions, turn: int = 0) -> None:
+        self.turn = turn
         for m in minions:
             if m.card_id.startswith("BGDUO"):
                 # Duos-exclusive card: positive proof of the mode.
@@ -56,6 +66,8 @@ class TribeTracker:
             card = cards.by_id(m.card_id)
             races = [r for r in (card.races if card else ()) if r != "ALL"]
             if len(races) == 1:
+                if races[0] not in self.proven:
+                    self.last_new_turn = turn
                 self.proven.add(races[0])
                 self.witness.setdefault(races[0], card.name if card else m.card_id)
             elif races:
@@ -63,8 +75,10 @@ class TribeTracker:
 
     @property
     def complete(self) -> bool:
-        """Once we have seen the full slate, anything unseen is absent."""
-        return len(self.proven) >= TRIBES_PER_GAME
+        """Once the slate has gone quiet for a while, anything unseen is absent."""
+        if self.turn < MIN_TURN:
+            return False
+        return (self.turn - self.last_new_turn) >= STAGNATION_TURNS
 
     def status(self, tribes: set[str]) -> str:
         """'active', 'absent', or 'unknown' for a set of tribes."""
@@ -75,6 +89,30 @@ class TribeTracker:
         if self.complete:
             return "absent"
         return "unknown"
+
+
+class CombatHistory:
+    """Per-turn damage taken and leaderboard place, straight from the log.
+
+    Deliberately nothing more clever than that: DAMAGE_DEALT_TO_HERO_LAST_TURN
+    and PLAYER_LEADERBOARD_PLACE are exact, already-computed facts (the second
+    is Blizzard's own live rank, accounting for all eight real players' true
+    health) -- there is no need to infer or simulate anything here.
+    """
+
+    def __init__(self) -> None:
+        self.turns: list[tuple[int, int, int]] = []  # (turn, damage_taken, place)
+
+    def reset(self) -> None:
+        self.turns.clear()
+
+    def observe(self, turn: int, damage_taken: int, place: int) -> None:
+        if turn <= 0 or (self.turns and self.turns[-1][0] == turn):
+            return
+        self.turns.append((turn, damage_taken, place))
+
+    def recent_damage(self, n: int = 3) -> list[int]:
+        return [d for _, d, _ in self.turns[-n:]]
 
 
 @dataclass
@@ -126,12 +164,45 @@ class Suggestion:
     reasons: list[str] = field(default_factory=list)
 
 
+@dataclass
+class PivotAdvice:
+    """Whether switching to a different build is worth considering right now.
+
+    Every field is either observed directly from your own game (board,
+    leaderboard place, damage taken) or Firestone's real per-hero, per-turn
+    population average -- never a guess about the other seven boards. The
+    numbers are always shown alongside the verdict, not hidden behind it.
+    """
+    comp: Comp
+    board_ratio: float | None    # your board's stats / population average this turn
+    leaderboard_place: int       # 1-8 from Blizzard's own live rank, 0 if unknown
+    recent_damage: list[int]     # damage taken in the last few turns, oldest first
+    missing_core: list[str]      # this comp's CORE cards you don't own yet
+    tier_gap: int                # tavern tiers above your current one they need
+    verdict: str
+
+    def describe(self) -> str:
+        bits = []
+        if self.board_ratio is not None:
+            bits.append(f"board {self.board_ratio * 100:.0f}% of average")
+        if self.leaderboard_place:
+            bits.append(f"place {self.leaderboard_place}")
+        if self.recent_damage:
+            bits.append(f"took {sum(self.recent_damage)} dmg last "
+                        f"{len(self.recent_damage)}t")
+        bits.append(f"{len(self.missing_core)} core piece(s) missing")
+        if self.tier_gap > 0:
+            bits.append(f"needs tier +{self.tier_gap}")
+        return ", ".join(bits)
+
+
 class Advisor:
     def __init__(self, cards: CardDB, stats: BGStats):
         self.cards = cards
         self.stats = stats
         self._tribes: dict[str, set[str]] = {}
         self.tracker = TribeTracker()
+        self.combat_history = CombatHistory()
 
     def comp_tribes(self, comp: Comp) -> set[str]:
         """The tribes a comp is actually built around, inferred from its cards."""
@@ -214,7 +285,8 @@ class Advisor:
 
     def evaluate_shop(self, bg) -> tuple[list[Suggestion], list[CompFit]]:
         # Everything the shop offers is evidence about which tribes are in play.
-        self.tracker.observe(self.cards, list(bg.shop) + list(bg.board))
+        self.tracker.observe(self.cards, list(bg.shop) + list(bg.board), bg.turn)
+        self.combat_history.observe(bg.turn, bg.damage_last_turn, bg.leaderboard_place)
         owned = [m.card_id for m in bg.board] + [m.card_id for m in bg.hand]
         tribes: dict[str, int] = {}
         for m in bg.board:
@@ -224,3 +296,72 @@ class Advisor:
         fits = self.comp_fits(owned, tribes, len(bg.board))
         sugg = [self.score_card(m.card_id, tribes, fits, bg.turn) for m in bg.shop]
         return sugg, fits
+
+    # -- pivot analysis ---------------------------------------------------
+    def board_power_ratio(self, bg) -> float | None:
+        """Your board's total stats against the real population average for
+        your hero at this turn. >1 is ahead of pace, <1 behind. None with no
+        benchmark to compare against -- never a fabricated number."""
+        hero = self.stats.hero(bg.hero_card_id)
+        if not hero or not bg.turn:
+            return None
+        benchmark = hero.warband_stats.get(bg.turn)
+        if not benchmark:
+            return None
+        mine = sum(m.atk + m.health for m in bg.board)
+        return mine / benchmark
+
+    def pivot_cost(self, comp: Comp, owned: set[str],
+                    current_tier: int) -> tuple[list[str], int]:
+        """This comp's missing CORE pieces, and how many tavern tiers above
+        your current one the furthest of them needs."""
+        missing = [cid for cid, role in comp.cards.items()
+                   if role == "CORE" and cid not in owned]
+        if not missing:
+            return missing, 0
+        tiers = [c.tier for c in (self.cards.by_id(cid) for cid in missing) if c]
+        return missing, max(0, max(tiers, default=current_tier) - current_tier)
+
+    def pivot_check(self, bg, fits: list[CompFit]) -> PivotAdvice | None:
+        """Is switching build worth considering right now?
+
+        Picks the strongest *actual pivot candidate* -- an available comp
+        whose tribe your board doesn't already share -- and grounds the call
+        in what's real: your board against the population average for your
+        hero at this turn, Blizzard's own live leaderboard rank, your recent
+        damage taken, and how many core pieces the switch actually needs.
+        Never models the other seven boards.
+        """
+        board_tribes: set[str] = set()
+        for m in bg.board:
+            card = self.cards.by_id(m.card_id)
+            board_tribes.update(r for r in (card.races if card else ()) if r != "ALL")
+        if not board_tribes:
+            return None    # nothing committed yet -- there is no "pivot" to weigh
+
+        candidates = [f for f in fits if f.available
+                      and not (self.comp_tribes(f.comp) & board_tribes)]
+        if not candidates:
+            return None
+        fit = max(candidates, key=lambda f: (f.comp.quality, f.affinity))
+
+        owned = {m.card_id for m in bg.board} | {m.card_id for m in bg.hand}
+        missing_core, tier_gap = self.pivot_cost(fit.comp, owned, bg.tier)
+        ratio = self.board_power_ratio(bg)
+        recent = self.combat_history.recent_damage()
+
+        if ratio is None:
+            pace = "no benchmark yet for your hero"
+        elif ratio >= 1.1:
+            pace = "ahead of pace"
+        elif ratio >= 0.9:
+            pace = "on pace"
+        else:
+            pace = "behind pace"
+        cost_bit = f"needs {len(missing_core)} core piece(s)"
+        if tier_gap:
+            cost_bit += f", up to tier {bg.tier + tier_gap}"
+        verdict = f"{pace} -- {fit.comp.name} {cost_bit}"
+
+        return PivotAdvice(fit.comp, ratio, bg.leaderboard_place, recent,
+                            missing_core, tier_gap, verdict)
