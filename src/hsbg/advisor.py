@@ -207,11 +207,14 @@ class PivotAdvice:
 
 class Advisor:
     def __init__(self, cards: CardDB, stats: BGStats):
+        from .learner import WeightLearner
+
         self.cards = cards
         self.stats = stats
         self._tribes: dict[str, set[str]] = {}
         self.tracker = TribeTracker()
         self.combat_history = CombatHistory()
+        self.learner = WeightLearner()
 
     def comp_tribes(self, comp: Comp) -> set[str]:
         """The tribes a comp is actually built around, inferred from its cards."""
@@ -372,6 +375,11 @@ class Advisor:
                 score += min(10.0, shared * 2.5)
                 reasons.append(f"{shared} on board share its tribe")
 
+        learned_delta = self.learner.card_delta(card_id, turn)
+        if abs(learned_delta) >= 0.25:
+            score += learned_delta
+            reasons.append(f"RL {learned_delta:+.1f}")
+
         return Suggestion(card_id, name, max(0.0, min(100.0, score)), reasons)
 
     def evaluate_shop(self, bg, observe: bool = True) -> tuple[list[Suggestion], list[CompFit]]:
@@ -382,9 +390,114 @@ class Advisor:
         return sugg, fits
 
     def score_choices(self, bg, card_ids: list[str]) -> list[Suggestion]:
-        """Score non-hero Discover options (minions, spells, trinkets, buddies)."""
+        """Score non-hero Discover options using meta stats + TurnPlanner ValueFunction lookahead (Phase 10)."""
+        from dataclasses import replace
+        from .i18n import get_lang
+        from .tavern import (
+            BOARD_LIMIT,
+            TMinion,
+            _apply_battlecry_effect,
+            _apply_spell_effect,
+            _non_golden_copies,
+            choose_one_labels,
+            snapshot_from_bg,
+        )
+        from .value import ValueFunction
+
         _, owned_counts, tribes, fits = self._board_context(bg)
-        return [self.score_card(cid, tribes, fits, bg.turn, owned_counts) for cid in card_ids]
+        base_suggs = [self.score_card(cid, tribes, fits, bg.turn, owned_counts) for cid in card_ids]
+        if not card_ids:
+            return base_suggs
+
+        try:
+            snap = snapshot_from_bg(bg)
+            vf = ValueFunction(self)
+            vf.prepare()
+            base_val = vf.evaluate(snap).total
+        except Exception:
+            return base_suggs
+
+        deltas: list[float] = []
+        best_opts: list[str] = []
+        for cid in card_ids:
+            card = self.cards.by_id(cid)
+            opts = choose_one_labels(cid)
+            best_dv = 0.0
+            best_opt_lbl = ""
+
+            if card and card.type == "MINION":
+                in_hand, in_board = _non_golden_copies(snap, cid)
+                forms_triple = (len(in_hand) + len(in_board)) >= 2
+                tm = TMinion(
+                    uid=snap.next_uid,
+                    card_id=cid,
+                    name=card.name or cid,
+                    atk=card.attack * (2 if forms_triple else 1),
+                    health=card.health * (2 if forms_triple else 1),
+                    tier=card.tier or snap.tier,
+                    golden=forms_triple,
+                    tribe=card.tribe,
+                )
+                if len(snap.board) < BOARD_LIMIT:
+                    cand_board = snap.board + (tm,)
+                elif snap.board:
+                    weak_idx = min(
+                        range(len(snap.board)),
+                        key=lambda i: (snap.board[i].golden, snap.board[i].tier, snap.board[i].atk + snap.board[i].health),
+                    )
+                    cand_board = snap.board[:weak_idx] + (tm,) + snap.board[weak_idx + 1 :]
+                else:
+                    cand_board = (tm,)
+                base_cand = replace(
+                    snap,
+                    board=cand_board,
+                    triples_formed=snap.triples_formed + (1 if forms_triple else 0),
+                )
+                if opts:
+                    s1 = _apply_battlecry_effect(base_cand, tm, option=1)
+                    s2 = _apply_battlecry_effect(base_cand, tm, option=2)
+                    v1 = vf.evaluate(s1).total - base_val
+                    v2 = vf.evaluate(s2).total - base_val
+                    if v1 >= v2:
+                        best_dv, best_opt_lbl = v1, opts[0]
+                    else:
+                        best_dv, best_opt_lbl = v2, opts[1]
+                else:
+                    s1 = _apply_battlecry_effect(base_cand, tm, option=0)
+                    best_dv = vf.evaluate(s1).total - base_val
+            else:
+                if opts:
+                    s1 = _apply_spell_effect(snap, cid, option=1)
+                    s2 = _apply_spell_effect(snap, cid, option=2)
+                    v1 = vf.evaluate(s1).total - base_val
+                    v2 = vf.evaluate(s2).total - base_val
+                    if v1 >= v2:
+                        best_dv, best_opt_lbl = v1, opts[0]
+                    else:
+                        best_dv, best_opt_lbl = v2, opts[1]
+                else:
+                    s1 = _apply_spell_effect(snap, cid, option=0)
+                    best_dv = vf.evaluate(s1).total - base_val
+
+            deltas.append(best_dv)
+            best_opts.append(best_opt_lbl)
+
+        avg_dv = sum(deltas) / len(deltas) if deltas else 0.0
+        is_uk = get_lang() == "uk"
+        out: list[Suggestion] = []
+        for sg, dv, opt_lbl in zip(base_suggs, deltas, best_opts):
+            rel_gain = dv - avg_dv
+            lookahead_bonus = max(-10.0, min(14.0, rel_gain * 1.1))
+            new_score = max(0.0, min(100.0, sg.score + lookahead_bonus))
+            new_reasons = list(sg.reasons)
+            if opt_lbl:
+                pref = "вибір" if is_uk else "pick"
+                new_reasons.insert(0, f"{pref}: [{opt_lbl}]")
+            if abs(dv) >= 0.5:
+                lbl = "план ΔV" if is_uk else "plan ΔV"
+                new_reasons.append(f"{lbl} {dv:+.1f}")
+            out.append(Suggestion(sg.card_id, sg.name, new_score, new_reasons))
+        return out
 
     def evaluate_spells(self, bg) -> list[Suggestion]:
         """Score Tavern Spells currently offered in the shop."""
@@ -536,6 +649,26 @@ class Advisor:
             "affordable": affordable_roll,
             "cost": roll_cost,
         }
+
+        # 3. Hero Power timing & target score (Phase 8: Reno, Zerek, Teron, Shudderwock, Galakrond, etc.)
+        hp = getattr(bg, "hero_power", None)
+        if hp is not None and not getattr(hp, "passive", False) and not getattr(hp, "used", False):
+            from .tavern import UseHeroPower, evaluate_hero_power_timing, snapshot_from_bg
+
+            snap = snapshot_from_bg(bg)
+            hp_eval = evaluate_hero_power_timing(snap)
+            has_hp_in_plan = any(isinstance(a, UseHeroPower) for a in plan_actions)
+            hp_score = float(hp_eval["score"])
+            if has_hp_in_plan:
+                hp_score = max(hp_score, 76.0)
+            out["hero_power"] = {
+                "score": max(0.0, min(100.0, hp_score)),
+                "affordable": bool(hp_eval["should_use"] and bg.gold >= (hp.cost or 0)),
+                "cost": hp.cost or 0,
+                "target": hp_eval.get("target_name", ""),
+                "hold_hint": hp_eval.get("hold_hint", ""),
+                "name": hp.name or hp.card_id,
+            }
         return out
 
     # -- pivot analysis ---------------------------------------------------

@@ -86,6 +86,47 @@ State (Perception) -> Action Space & Transition Model -> Search / Policy (Value 
   - метрики: latency (`p50/p95`), % збігу з ходами гравця, симульований приріст winrate, точність симулятора бою.
 - [x] **Headless Gym-середовище (`src/hsbg/env.py`)**:
   - closed-loop симулятор `BGGymEnv` (`reset / step / play_episode`) поверх `tavern.py` + `combat.py`.
-- [ ] **Подальший розвиток (Next Steps)**:
-  - авто-тюнінг ваг `ValueFunction` (CMA-ES / Optuna) на великій вибірці збережених логів;
-  - розширення покриття специфічних Trinket/Anomaly модифікаторів та end-of-turn баферів у `tavern.py`.
+
+---
+
+## Phase 7 — Online & Self-Play RL Weight Learner (`src/hsbg/learner.py`)
+
+- [x] **Таблиця навчених RL-поправок (`data/learned_weights.json`)**:
+  - поправки скору карт $\Delta w[\text{card\_id}, \text{phase}] \in [-12, +12]$ за фазами гри (`global`, `early` ходи 1–3, `mid` ходи 4–7, `late` ходи 8+);
+  - ковзний baseline $\bar{G}_t$ на кожен хід для центрованого Advantage-оновлення $A_t = G_t - \bar{G}_t$.
+- [x] **Пул опонентів (`Lowroll` 20% / `Average` 60% / `Goldfish` 20% + `Ghost Pool`)**:
+  - збереження реальних столів суперників із живих ігор та столів самого агента з попередніх епізодів (`ghost_boards[turn]`);
+  - стратифікований семплінг суперників за квантилями сили (`ghost-lowroll`, `ghost-average`, `ghost-goldfish`).
+- [x] **Онлайн-навчання під час живої гри та Hot-Reload (`tools/overlay.py`)**:
+  - автоматичне оновлення ваг карт після кожного реального бою без перезапуску оверлею;
+  - hot-reload `data/learned_weights.json` за `mtime` при паралельному запуску `tools/eval_agent.py --train N`.
+
+---
+
+## Phase 8 — Таймінг Hero Power та одноразові / кулдаун здібності героїв (Reno, Zerek, Galakrond тощо)
+
+- [x] **Класифікація Hero Powers за типом ресурсу (`src/hsbg/tavern.py`, `src/hsbg/advisor.py`)**:
+  - **One-shot / Once-per-game** (`Reno Jackson` — зробити міньйона золотим; `Zerek, Master Cloner` — клонувати міньйона): жорстке блокування використання на ранні T1–T3 філери; рекомендація активації **лише** за наявності на столі підтвердженої `CORE` T4–T6 карти цільового білду (`Banana Slamma`, `Titus Rivendare`, `Brann`, `Drakkari`, `Persistent Poet` тощо) або в режимі `emergency survival` (`HP + Armor <= 15` перед потенційним леталом) із явною вказівкою, **в яку саме карту** дати абілку.
+  - **Once-per-turn targeted / scaling / economy** (`Galakrond`, `Tess Greymane`, `Scabbs`, `Maiev`, `Lich Baz'hial`, `Guff`, `Shudderwock`): розрахунок точного ходу/умови, коли натискання абілки максимізує EV відносно кривої апу таверни.
+- [x] **Відображення в оверлеї (`tools/overlay.py`)**:
+  - окремий бейдж біля кнопки Hero Power (`⚡ АБІЛКА <скор>` + цільова карта `-> Назва карти`, або `⏳ ТРИМАТИ під T5/T6 Ядро`).
+
+---
+
+## Phase 9 — Карти з вибором ефекту (`Choose One` / Dark Gifts / Targeted Spells)
+
+- [x] **Моделювання гілок вибору (`ChooseOption`) у `src/hsbg/tavern.py`**:
+  - підтримка карт із розгалуженим ефектом (`Sprightly Scarab`: `+1/+1 і Reborn` vs `+3/+3 і Taunt`; `Living Azerite`, спели та бафи з вибором опції/цілі);
+  - генерація окремих гілок дії `PlayMinion(hand_idx, target_idx, option_idx)` у дереві `TurnPlanner`.
+- [x] **Оцінка кожної опції через `ValueFunction` + `combat.simulate()`**:
+  - автоматичний вибір опції та цільового міньйона на столі (наприклад, `Reborn` на ключовий дезратл/скалер або `Taunt` на фронтлайн-танк) із виводом у `ПЛАН НА ХІД`: `Виставити Sprightly Scarab -> [Reborn] на Buzzing Vermin`.
+
+---
+
+## Phase 10 — Прорахунок розкопок (`Discover`) через TurnPlanner Lookahead
+
+- [x] **Перехід від статичного скору розкопки до Lookahead-оцінки стану (`src/hsbg/planner.py`, `src/hsbg/advisor.py`)**:
+  - для кожного з 3–4 варіантів у вікні `DISCOVER` (нагорода за триплет, розкопка міньйона/спела/трінкета) симулювати додавання кандидата $c_i$ у поточний `GameSnapshot` і запускати `TurnPlanner` + `combat.simulate()` на отриманому столі;
+  - ранжувати варіанти розкопки за повним приростом цінності стану $\Delta V(S \oplus c_i)$ (враховуючи, чи закриває карта триплет, чи активує ядро білду і як змінює winrate у найближчому бою).
+- [x] **Візуальні бейджі поверх карт розкопки в оверлеї (`tools/overlay.py`)**:
+  - малювання оцінок (`★ 88`, `71`, `54`) та короткої причини прямо над картами у вікні `DISCOVER` посеред екрана.

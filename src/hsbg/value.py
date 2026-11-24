@@ -58,12 +58,20 @@ def tminion_to_cminion(m: TMinion, cards=None) -> CMinion:
     )
 
 
-def synthetic_enemy_board(turn: int, tier: int) -> list[CMinion]:
+def synthetic_enemy_board(turn: int, tier: int, power_mult: float = 1.0) -> list[CMinion]:
     """Build a turn-calibrated benchmark warband when the next opponent's board is unseen."""
     t = max(1, turn)
-    count = min(7, max(1, t if t <= 4 else (t - 1 if t <= 6 else 7)))
-    # Population average total stats (atk+hp) grows roughly as ~4.5 * t^1.42
-    total_stats = max(4.0, 4.5 * (t ** 1.42))
+    # Realistic board counts: Turn 1 = 1 minion, Turn 2 = 1 minion (most level to T2),
+    # Turn 3 = 2-3 minions, Turn 4 = 4 minions, Turn 5 = 5 minions, Turn 6 = 6 minions, Turn 7+ = 7 minions.
+    if t <= 2:
+        count = 1
+    elif t == 3:
+        count = 2
+    else:
+        count = min(7, t)
+    # Calibrated to actual shop minion stats + early/mid buffs, scaled by power_mult (lowroll/average/goldfish)
+    base_Curve = {1: 4.5, 2: 5.0, 3: 11.5, 4: 18.0, 5: 25.0, 6: 33.0, 7: 41.0, 8: 50.0, 9: 60.0, 10: 70.0, 11: 82.0, 12: 95.0}
+    total_stats = max(3.0, base_Curve.get(t, 95.0 + (t - 12) * 14.0) * power_mult)
     per_unit = max(2, int(round(total_stats / count)))
     atk = max(1, per_unit // 2)
     hp = max(1, per_unit - atk)
@@ -72,10 +80,11 @@ def synthetic_enemy_board(turn: int, tier: int) -> list[CMinion]:
         CMinion(
             card_id=f"BENCH_{i}",
             name=f"Benchmark {i + 1}",
-            atk=atk + (i % 2),
-            health=hp + ((i + 1) % 2),
+            atk=max(1, atk + (1 if (i % 2 == 0 and per_unit >= 5) else 0)),
+            health=max(1, hp + (1 if (i % 2 == 1 and per_unit >= 5) else 0)),
             tier=unit_tier,
             taunt=(i == count - 1 and t >= 4),
+            divine_shield=(i == 0 and t >= 6 and power_mult >= 1.15),
         )
         for i in range(count)
     ]
@@ -93,6 +102,9 @@ class ValueFunction:
 
     def prepare(self) -> None:
         """Snapshot comp availability and active minion pool once per search."""
+        if getattr(self.advisor, "learner", None) is not None:
+            if self.advisor.learner.load(force=False):
+                self._card_quality_cache.clear()
         rank = {"active": 0, "unknown": 1, "absent": 2}
         meta = []
         for comp in self.advisor.stats.comps:
@@ -142,6 +154,9 @@ class ValueFunction:
             if here is not None:
                 delta = max(-0.5, min(0.5, here - stat.impact))
                 q += delta * 3.0
+        learner = getattr(self.advisor, "learner", None)
+        if learner is not None:
+            q += learner.card_delta(card_id, turn) * 0.40
         self._card_quality_cache[key] = q
         return q
 

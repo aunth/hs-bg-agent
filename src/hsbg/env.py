@@ -11,8 +11,11 @@ from dataclasses import dataclass, replace
 
 from .carddb import CardDB
 from .combat import simulate
+from .learner import WeightLearner
 from .tavern import (
     Action,
+    BuyMinion,
+    BuySpell,
     EndTurn,
     GameSnapshot,
     MinionPool,
@@ -41,10 +44,12 @@ class BGGymEnv:
         cards: CardDB | None = None,
         seed: int = 42,
         max_turns: int = 12,
+        learner: WeightLearner | None = None,
     ) -> None:
         self.cards = cards or CardDB()
         self.rng = random.Random(seed)
         self.max_turns = max_turns
+        self.learner = learner or WeightLearner()
         self.pool = MinionPool(self.cards)
         self.state: GameSnapshot = self._initial_snapshot()
         self._uid_counter = 500_000
@@ -77,7 +82,12 @@ class BGGymEnv:
 
     def _resolve_combat_and_advance_turn(self, snap: GameSnapshot) -> StepResult:
         my_board = [tminion_to_cminion(m, self.cards) for m in snap.board]
-        enemy_board = synthetic_enemy_board(snap.turn, snap.tier)
+        enemy_board, opp_profile = self.learner.sample_opponent_board(
+            snap.turn,
+            snap.tier,
+            self.cards,
+            self.rng,
+        )
         sim = simulate(
             my_board,
             enemy_board,
@@ -101,6 +111,15 @@ class BGGymEnv:
         rem_dmg = max(0, dmg_taken - snap.hero_armor)
         new_hp = max(0, snap.hero_health - rem_dmg)
 
+        info_dict = {
+            "win_pct": sim.win_pct,
+            "tie_pct": sim.tie_pct,
+            "loss_pct": sim.loss_pct,
+            "damage_taken": dmg_taken,
+            "total_hp": total_hp,
+            "opp_profile": opp_profile,
+        }
+
         done = (new_hp <= 0) or (snap.turn >= self.max_turns)
         if done:
             final_snap = replace(snap, hero_health=new_hp, hero_armor=new_armor)
@@ -108,7 +127,7 @@ class BGGymEnv:
                 snapshot=final_snap,
                 reward=round(reward, 2),
                 done=True,
-                info={"win_pct": sim.win_pct, "damage_taken": dmg_taken, "total_hp": total_hp},
+                info=info_dict,
             )
 
         next_turn = snap.turn + 1
@@ -152,7 +171,7 @@ class BGGymEnv:
             snapshot=next_snap,
             reward=round(reward, 2),
             done=False,
-            info={"win_pct": sim.win_pct, "damage_taken": dmg_taken, "total_hp": total_hp},
+            info=info_dict,
         )
 
     def step(self, action: Action) -> StepResult:
@@ -166,31 +185,47 @@ class BGGymEnv:
             nxt = replace(
                 nxt,
                 shop=self._next_shop(nxt.tier),
+                roll_cost=1,
                 rolled=False,
             )
         self.state = nxt
         return StepResult(snapshot=nxt, reward=0.0, done=False, info={})
 
-    def play_episode(self, planner, max_actions_per_turn: int = 12) -> dict:
+    def play_episode(
+        self,
+        planner,
+        max_actions_per_turn: int = 12,
+        verbose: bool = False,
+        learn: bool = True,
+    ) -> dict:
         """Run a full closed-loop autonomous episode driven by `planner`."""
         snap = self.reset()
         total_reward = 0.0
         turns_survived = 0
         actions_taken = 0
+        trajectory: list[dict] = []
 
         while True:
             steps_this_turn = 0
+            turn_actions: list[str] = []
+            bought_cards: list[str] = []
             while steps_this_turn < max_actions_per_turn:
                 plan = planner.plan(self.state)
                 if not plan.actions:
                     break
                 first_act = plan.actions[0]
-                res = self.step(first_act)
+                if isinstance(first_act, (BuyMinion, BuySpell)):
+                    bought_cards.append(first_act.card_id)
+                turn_actions.append(first_act.describe())
+                self.step(first_act)
                 actions_taken += 1
                 steps_this_turn += 1
                 # If the plan didn't end in RollShop, execute the remaining planned steps directly
                 if not isinstance(first_act, RollShop):
                     for follow_act in plan.actions[1:]:
+                        if isinstance(follow_act, (BuyMinion, BuySpell)):
+                            bought_cards.append(follow_act.card_id)
+                        turn_actions.append(follow_act.describe())
                         if isinstance(follow_act, RollShop):
                             self.step(follow_act)
                             actions_taken += 1
@@ -201,12 +236,45 @@ class BGGymEnv:
                         steps_this_turn += 1
                     else:
                         break
+            pre_combat = self.state
+            my_cboard = [tminion_to_cminion(m, self.cards) for m in pre_combat.board]
             end_res = self.step(EndTurn())
+            if learn and my_cboard:
+                self.learner.record_ghost_board(pre_combat.turn, my_cboard)
+            trajectory.append({
+                "turn": pre_combat.turn,
+                "bought_cards": bought_cards,
+                "board_cards": [m.card_id for m in pre_combat.board],
+                "reward": end_res.reward,
+            })
             total_reward += end_res.reward
             turns_survived = snap.turn
+            if verbose:
+                board_str = ", ".join(
+                    f"{m.name}{'*' if m.golden else ''} {m.atk}/{m.health}"
+                    for m in pre_combat.board
+                ) or "(порожньо)"
+                acts_str = " -> ".join(turn_actions) if turn_actions else "Утриматись"
+                win_pct = end_res.info.get("win_pct", 0.0)
+                tie_pct = end_res.info.get("tie_pct", 0.0)
+                loss_pct = end_res.info.get("loss_pct", 0.0)
+                dmg = end_res.info.get("damage_taken", 0)
+                hp = end_res.info.get("total_hp", 0)
+                prof = end_res.info.get("opp_profile", "average")
+                print(
+                    f"  Хід {pre_combat.turn:2d} | T{pre_combat.tier} | дії: {acts_str}\n"
+                    f"         | стіл ({len(pre_combat.board)}): {board_str}\n"
+                    f"         | бій [{prof}]: win={win_pct:5.1f}%  tie={tie_pct:4.1f}%  loss={loss_pct:5.1f}%  dmg=-{dmg}  HP={hp}"
+                )
             snap = end_res.snapshot
             if end_res.done:
                 break
+
+        updated_cards = {}
+        if learn:
+            updated_cards = self.learner.update_from_trajectory(trajectory)
+            if getattr(planner, "value_fn", None) is not None:
+                planner.value_fn._card_quality_cache.clear()
 
         return {
             "turns_survived": turns_survived,
@@ -215,4 +283,5 @@ class BGGymEnv:
             "final_hp": self.state.hero_health + self.state.hero_armor,
             "total_reward": round(total_reward, 2),
             "actions_taken": actions_taken,
+            "updated_cards": len(updated_cards),
         }

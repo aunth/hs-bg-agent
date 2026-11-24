@@ -154,7 +154,70 @@ def evaluate_capture(path: Path, cards: CardDB, stats: BGStats) -> dict:
     }
 
 
+def run_autonomous_episodes(episodes: int, cards: CardDB, stats: BGStats) -> int:
+    from hsbg.env import BGGymEnv
+
+    advisor = Advisor(cards, stats)
+    planner = TurnPlanner(advisor)
+    learner = advisor.learner
+    print(f"=== Автономна гра & RL-навчання BGGymEnv ({episodes} епізод(ів)) ===\n")
+    results = []
+    for ep in range(1, episodes + 1):
+        env = BGGymEnv(cards=cards, seed=int(1000 + learner.episodes_trained + ep), max_turns=12, learner=learner)
+        if episodes <= 5:
+            print(f"--- Епізод #{ep} (total_trained={learner.episodes_trained + 1}) ---")
+        res = env.play_episode(planner, verbose=(episodes <= 5), learn=True)
+        results.append(res)
+        if episodes <= 5:
+            print(
+                f"  => Підсумок #{ep}: ходів={res['turns_survived']} | фінальний тір=T{res['final_tier']} | "
+                f"карт на столі={res['final_board_size']} | залишок HP={res['final_hp']} | "
+                f"дій={res['actions_taken']} | оновлено карт={res['updated_cards']} | reward={res['total_reward']:+.2f}\n"
+            )
+    if len(results) > 1:
+        avg_hp = statistics.mean(r["final_hp"] for r in results)
+        avg_tier = statistics.mean(r["final_tier"] for r in results)
+        avg_rew = statistics.mean(r["total_reward"] for r in results)
+        print(
+            f"=== Середнє за {len(results)} ігор: тір={avg_tier:.1f} | залишок HP={avg_hp:.1f} | reward={avg_rew:+.2f} ==="
+        )
+
+    # Display top learned card weight adjustments (boosted vs penalized)
+    scored_weights = []
+    for cid, w in learner.card_weights.items():
+        c = cards.by_id(cid)
+        nm = (c.name if c else "") or cid
+        tier = c.tier if c else 0
+        g_delta = float(w.get("global", 0.0))
+        n_obs = int(w.get("n", 0))
+        if abs(g_delta) >= 0.05:
+            scored_weights.append((g_delta, nm, tier, n_obs, w))
+    scored_weights.sort(key=lambda x: -x[0])
+    if scored_weights:
+        print(f"\n--- Навчені RL-поправки скору карт (data/learned_weights.json, всього епізодів: {learner.episodes_trained}) ---")
+        top_up = [x for x in scored_weights if x[0] > 0][:6]
+        top_dn = [x for x in reversed(scored_weights) if x[0] < 0][:6]
+        if top_up:
+            print("  ▲ Підвищений скор (виграють бої):")
+            for g_d, nm, tier, n_obs, w in top_up:
+                print(f"    + {nm:<24} (T{tier}) : {g_d:+.2f} балів  (early={w.get('early',0):+.2f}, mid={w.get('mid',0):+.2f}, late={w.get('late',0):+.2f}, n={n_obs})")
+        if top_dn:
+            print("  ▼ Знижений скор (програють бої):")
+            for g_d, nm, tier, n_obs, w in top_dn:
+                print(f"    - {nm:<24} (T{tier}) : {g_d:+.2f} балів  (early={w.get('early',0):+.2f}, mid={w.get('mid',0):+.2f}, late={w.get('late',0):+.2f}, n={n_obs})")
+    return 0
+
+
 def main() -> int:
+    cards = CardDB()
+    stats = BGStats()
+
+    for flag in ("--train", "--episodes"):
+        if flag in sys.argv:
+            idx = sys.argv.index(flag)
+            ep_count = int(sys.argv[idx + 1]) if (idx + 1 < len(sys.argv) and sys.argv[idx + 1].isdigit()) else 5
+            return run_autonomous_episodes(ep_count, cards, stats)
+
     args = [Path(a) for a in sys.argv[1:] if not a.startswith("-")]
     if not args:
         args = sorted((ROOT / "data/captures").glob("*/Power.log"))

@@ -374,11 +374,122 @@ class TurnPlannerTests(unittest.TestCase):
         adv = _make_advisor()
         planner = TurnPlanner(adv)
         env = BGGymEnv(cards=adv.cards, seed=7, max_turns=5)
-        summary = env.play_episode(planner)
+        summary = env.play_episode(planner, learn=False)
         self.assertEqual(summary["turns_survived"], 5)
         self.assertGreaterEqual(summary["final_tier"], 2)
         self.assertGreaterEqual(summary["final_board_size"], 2)
         self.assertGreater(summary["actions_taken"], 5)
+
+    def test_reno_and_zerek_hero_powers_hold_early_and_trigger_on_core_engine(self) -> None:
+        from hsbg.tavern import evaluate_hero_power_timing
+
+        # Early turn with only T1/T2 minions: Reno (TB_BaconShop_HP_046) must NOT trigger
+        early_reno = GameSnapshot(
+            turn=3,
+            tier=2,
+            gold=0,
+            upgrade_cost=6,
+            board=(TMinion(1, "T1_GOOD", "Good T1", 3, 3, 1),),
+            hero_power_id="TB_BaconShop_HP_046",
+            hero_power_name="Gonna Be Rich!",
+            hero_power_cost=0,
+            hero_power_usable=True,
+        )
+        ev_early = evaluate_hero_power_timing(early_reno)
+        self.assertFalse(ev_early["should_use"])
+        self.assertTrue(bool(ev_early["hold_hint"]))
+        self.assertFalse(any(isinstance(a, UseHeroPower) for a in legal_actions(early_reno)))
+
+        # With T5 Titus Rivendare on board: Reno triggers and targets Titus Rivendare!
+        late_reno = GameSnapshot(
+            turn=7,
+            tier=4,
+            gold=0,
+            upgrade_cost=7,
+            board=(
+                TMinion(1, "T1_GOOD", "Good T1", 3, 3, 1),
+                TMinion(2, "BG_FP1_031", "Titus Rivendare", 1, 7, 5),
+            ),
+            hero_power_id="TB_BaconShop_HP_046",
+            hero_power_name="Gonna Be Rich!",
+            hero_power_cost=0,
+            hero_power_usable=True,
+        )
+        ev_late = evaluate_hero_power_timing(late_reno)
+        self.assertTrue(ev_late["should_use"])
+        self.assertEqual(ev_late["target_name"], "Titus Rivendare")
+        hp_acts = [a for a in legal_actions(late_reno) if isinstance(a, UseHeroPower)]
+        self.assertEqual(len(hp_acts), 1)
+        self.assertEqual(hp_acts[0].target_name, "Titus Rivendare")
+        after_reno = apply_action(late_reno, hp_acts[0])
+        self.assertTrue(after_reno.board[1].golden)
+
+        # Zerek (BG31_HERO_005p) clones Banana Slamma when on board
+        zerek_snap = GameSnapshot(
+            turn=6,
+            tier=4,
+            gold=0,
+            upgrade_cost=7,
+            board=(TMinion(10, "BG26_802", "Banana Slamma", 3, 6, 4),),
+            hero_power_id="BG31_HERO_005p",
+            hero_power_name="Cloning Gallery",
+            hero_power_cost=0,
+            hero_power_usable=True,
+        )
+        z_acts = [a for a in legal_actions(zerek_snap) if isinstance(a, UseHeroPower)]
+        self.assertEqual(len(z_acts), 1)
+        after_zerek = apply_action(zerek_snap, z_acts[0])
+        self.assertEqual(len(after_zerek.board), 2)
+
+    def test_choose_one_cards_branch_into_two_options(self) -> None:
+        snap = GameSnapshot(
+            turn=4,
+            tier=3,
+            gold=0,
+            upgrade_cost=6,
+            board=(TMinion(1, "CORE_1", "Beast Core", 5, 5, 4, tribe="Beast"),),
+            hand=(TMinion(2, "BG27_084", "Sprightly Scarab", 2, 1, 3, tribe="Beast"),),
+        )
+        play_acts = [a for a in legal_actions(snap) if isinstance(a, PlayMinion)]
+        self.assertEqual(len(play_acts), 2)
+        self.assertEqual({a.option for a in play_acts}, {1, 2})
+        self.assertTrue(all(bool(a.option_label) for a in play_acts))
+        s1 = apply_action(snap, play_acts[0])
+        s2 = apply_action(snap, play_acts[1])
+        self.assertNotEqual((s1.board[0].atk, s1.board[0].health), (s2.board[0].atk, s2.board[0].health))
+
+    def test_discover_lookahead_prefers_triple_and_core_options(self) -> None:
+        adv = _make_advisor()
+
+        class DummyBG:
+            turn = 6
+            tier = 4
+            gold = 0
+            upgrade_cost = 7
+            reroll_cost = 1
+            buy_cost = 3
+            hero_card_id = ""
+            hero_health = 30
+            hero_armor = 5
+            leaderboard_place = 2
+            hero_power = None
+            shop = []
+            shop_spells = []
+            hand = []
+            board = [
+                TMinion(1, "CORE_1", "Beast Core", 5, 5, 4, tribe="Beast"),
+                TMinion(2, "CORE_1", "Beast Core", 5, 5, 4, tribe="Beast"),
+            ]
+            cards = adv.cards
+
+        # Give TMinions `.id` for BGState compatibility
+        for idx, m in enumerate(DummyBG.board, 1):
+            object.__setattr__(m, "id", idx)
+
+        scored = adv.score_choices(DummyBG(), ["T1_TRASH", "CORE_1", "T1_GOOD"])
+        self.assertEqual(len(scored), 3)
+        self.assertGreater(scored[1].score, scored[0].score)
+        self.assertGreater(scored[1].score, scored[2].score)
 
 
 if __name__ == "__main__":

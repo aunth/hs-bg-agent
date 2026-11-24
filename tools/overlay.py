@@ -27,6 +27,7 @@ import Quartz  # noqa: E402
 from PyObjCTools import AppHelper  # noqa: E402
 
 from hsbg import parser as P  # noqa: E402
+from hsbg.actuator import AutoActuator  # noqa: E402
 from hsbg.carddb import CardDB  # noqa: E402
 from hsbg.combat import simulate  # noqa: E402
 from hsbg.state import BGState, EntityStore, OpponentTracker  # noqa: E402
@@ -49,7 +50,7 @@ from hsbg.i18n import (  # noqa: E402
 from hsbg.planner import TurnPlanner  # noqa: E402
 from hsbg.tail import PowerLogFollower  # noqa: E402
 
-PANEL_W, MARGIN = 330.0, 18.0
+PANEL_W, MARGIN = 390.0, 18.0
 CARD_W, CARD_H, CARD_GAP = 72.0, 109.0, 6.0     # 256x388 rendered card, scaled
 CARD_ROW_H = CARD_H + 22.0                      # card height + role caption + row gap
 BOARDS, TITLE_H = 3, 20.0                       # builds listed, row height
@@ -67,6 +68,25 @@ def _clean_card_text(raw: str) -> str:
     txt = raw.replace("[x]", "").replace("\n", " ").replace("\r", " ")
     txt = _HTML_TAG.sub("", txt)
     return " ".join(txt.split()) or "No card text."
+
+
+def _wrap_panel_text(text: str, width: int = 46, indent: str = "    ") -> list[str]:
+    """Wrap a long panel line at word boundaries so strategy & steps are never cut off with '…'."""
+    if len(text) <= width:
+        return [text]
+    words = text.split(" ")
+    lines: list[str] = []
+    curr = ""
+    for w in words:
+        cand = f"{curr} {w}" if curr else w
+        if len(cand) <= width or not curr:
+            curr = cand
+        else:
+            lines.append(curr)
+            curr = f"{indent}{w}"
+    if curr:
+        lines.append(curr)
+    return lines
 BUTTONS = {
     "TB_BaconShop_DragBuy": "BUY", "TB_BaconShop_DragBuy_Spell": "BUY SPELL",
     "TB_BaconShop_DragSell": "SELL", "TB_BaconShop_8p_Reroll_Button": "REROLL",
@@ -127,7 +147,7 @@ def hearthstone_bounds():
 class Model:
     """Shared state between the log-reading thread and the UI thread."""
 
-    def __init__(self):
+    def __init__(self, autoplay: bool = False):
         self.lock = threading.RLock()
         self.store = EntityStore()
         self.bg = BGState(self.store, CardDB())
@@ -135,6 +155,7 @@ class Model:
         self.advisor = Advisor(self.bg.cards, self.stats)
         self.opponents = OpponentTracker()
         self.planner = TurnPlanner(self.advisor)
+        self.actuator = AutoActuator(enabled=autoplay)
         self.art = ArtCache()
         self.choice = None
         self.action = None
@@ -147,17 +168,29 @@ class Model:
         self._plan_dirty = True
         self._cached_board_snap = None
         self._board_snap_dirty = True
+        self._cached_ui_lines = None
+        self._cached_ui_badges = None
+        self._ui_dirty = True
         self.left_click_comps: list[tuple[int, str]] = []  # (line_index, comp_id) in left panel
+        self._pre_combat_board_ids: list[str] = []
+        self._turn_bought_ids: list[str] = []
+        self._last_combat_turn: int = 0
+        self._last_enemy_cboard: list = []
 
     def apply_event(self, ev, catching_up: bool = False):
         """Apply a single parsed event under lock. Returns pending combat sim args if triggered."""
         self.store.apply(ev)
         self._plan_dirty = True
         self._board_snap_dirty = True
+        self._ui_dirty = True
         if isinstance(ev, P.CreateGame):
             self.choice, self.action = None, None
             self.combat_sim, self._sim_raw_turn = None, -1
             self._cached_plan = None
+            self._pre_combat_board_ids = []
+            self._turn_bought_ids = []
+            self._last_combat_turn = 0
+            self._last_enemy_cboard = []
             # Each lobby has its own tribe slate and mode.
             self.advisor.tracker.reset()
             self.advisor.combat_history.reset()
@@ -184,11 +217,39 @@ class Model:
                             self.opponents.observe_combat(self.bg)
                             tier = max(1, self.bg.tier)
                             self._sim_raw_turn = raw_turn
+                            self._last_combat_turn = self.bg.turn
+                            self._last_enemy_cboard = opp
                             return (raw_turn, mine, opp, tier)
         elif isinstance(ev, P.TagChange) and ev.ref.is_game and ev.tag in ("TURN", "VISUAL_TURN"):
             self.advisor.observe(self.bg)
             if not self.bg.visual_in_combat:
                 self.combat_sim = None
+            if not catching_up and ev.tag == "TURN":
+                new_raw = int(ev.value) if ev.value.isdigit() else 0
+                if new_raw % 2 == 0:
+                    # Combat starting: snapshot which cards were on our board / bought this turn
+                    curr_board = [m.card_id for m in self.bg.board if m.card_id]
+                    prev_set = set(self._pre_combat_board_ids)
+                    self._turn_bought_ids = [cid for cid in curr_board if cid not in prev_set]
+                    self._pre_combat_board_ids = curr_board
+                elif new_raw > 1 and self._last_combat_turn > 0 and self._pre_combat_board_ids:
+                    # Next shop phase started: update online RL weights from actual combat outcome!
+                    dmg = self.bg.damage_last_turn
+                    if dmg > 0:
+                        reward = -1.2 - 0.15 * dmg
+                    elif self.combat_sim is not None and self.combat_sim[1].win_pct >= 55.0:
+                        reward = 1.6
+                    else:
+                        reward = 0.6
+                    self.advisor.learner.update_from_live_combat(
+                        turn=self._last_combat_turn,
+                        bought_cards=self._turn_bought_ids,
+                        board_cards=self._pre_combat_board_ids,
+                        combat_reward=reward,
+                        enemy_board=self._last_enemy_cboard or None,
+                    )
+                    self.planner.value_fn._card_quality_cache.clear()
+                    self._last_combat_turn = 0
         return None
 
     def run(self):
@@ -260,11 +321,29 @@ class Model:
                 new_plan = self.planner.plan(snap_in, enemy_board=enemy_in)
                 with self.lock:
                     self._cached_plan = new_plan
+                    self._ui_dirty = True
 
             if self._board_snap_dirty:
                 self.board_snapshot()
 
-            time.sleep(0.10)
+            time.sleep(0.08)
+
+    def run_actuator(self):
+        """Dedicated background thread for `--autoplay` mouse execution so it never blocks log polling or UI."""
+        while True:
+            if self.actuator.enabled:
+                try:
+                    hb = hearthstone_bounds()
+                    if hb:
+                        act_msg = self.actuator.step(self, hb)
+                        if act_msg:
+                            with self.lock:
+                                self.action = act_msg
+                                self.action_at = time.time()
+                                self._ui_dirty = True
+                except Exception as exc:
+                    print(f"actuator error: {exc!r}", flush=True)
+            time.sleep(0.12)
 
     def has_live_data(self) -> bool:
         """True once a match session has been seen and has builds/tribes to show.
@@ -375,11 +454,30 @@ class Model:
         return self._cached_plan
 
     def shop_badges(self) -> dict:
-        """Per-card and tavern-action (Upgrade / Reroll) floating badge data for Bob's tavern."""
+        """Per-card, Discover, and tavern-action (Upgrade / Reroll / Hero Power) floating badge data."""
         with self.lock:
             bg = self.bg
-            if not self.session or bg.visual_in_combat or self.choice is not None or bg.turn <= 0:
+            if not self.session or bg.visual_in_combat or bg.turn <= 0:
                 return {"cards": [], "actions": {}}
+
+            # Phase 10: Floating Discover score badges directly over the 3-4 Discover cards
+            if self.choice is not None:
+                if self.choice.choice_type == "MULLIGAN":
+                    return {"cards": [], "actions": {}}
+                cids = [r.card_id or "" for r in self.choice.entities]
+                scored = self.advisor.score_choices(bg, cids)
+                best_disc = max((s.score for s in scored), default=0.0)
+                disc_cards: list[dict] = []
+                for r, sg in zip(self.choice.entities, scored):
+                    top = bool(sg.score >= best_disc - 0.01 and sg.score >= 55.0)
+                    disc_cards.append({
+                        "name": sg.name or r.name or r.card_id or "?",
+                        "score": sg.score,
+                        "top": top,
+                        "frozen": False,
+                        "is_spell": False,
+                    })
+                return {"cards": disc_cards, "actions": {}, "is_discover": True}
             sugg, _ = self.advisor.evaluate_shop(bg, observe=False)
             by_id = {s.card_id: s for s in sugg}
             spell_suggs = {s.card_id: s for s in self.advisor.evaluate_spells(bg)} if bg.shop_spells else {}
@@ -454,13 +552,14 @@ class Model:
             action = self.action if (time.time() - self.action_at) < 6.0 else None
 
             lang_badge = "[UA]" if get_lang() == "uk" else "[EN]"
+            auto_badge = "[AUTO: ON]" if self.actuator.enabled else "[AUTO: OFF]"
             if live:
                 flag = t("live")
             elif age:
                 flag = f"○ {format_ago(age)}"
             else:
                 flag = t("idle")
-            out = [(f"{t('app_title')}  {flag}  {lang_badge}", "head")]
+            out = [(f"{t('app_title')}  {flag}  {lang_badge} {auto_badge}", "good" if self.actuator.enabled else "head")]
             if not self.session:
                 out.append((t("waiting_match"), "dim"))
                 return out
@@ -516,33 +615,47 @@ class Model:
                             out.append((f"    · {tr_reason(reason)}", "dim"))
             plan = self._current_plan_unlocked()
             if plan is not None:
+                uk = get_lang() == "uk"
                 out.append(("", "dim"))
-                out.append((t("turn_plan"), "sub"))
+                out.append(("__BOX_MAIN_START__", "sub"))
+                main_title = "★ ОСНОВНИЙ ПЛАН НА ХІД" if uk else "★ PRIMARY TURN PLAN"
                 if plan.target_comp:
                     tc = plan.target_comp.comp
-                    out.append((f"  -> {tc.name} ({tc.power_level})", "head"))
+                    main_title += f"  ·  {tc.name} ({tc.power_level})"
+                out.append((main_title, "head"))
+                for wline in _wrap_panel_text(plan.explain_strategy(), width=43, indent=""):
+                    out.append((wline, "stat"))
                 for step in plan.format_steps():
-                    txt = step if len(step) <= 36 else step[:35] + "…"
                     is_hold = step.startswith("Hold") or step.startswith("Утриматись")
                     style = "dim" if is_hold else "good"
-                    out.append((f"  {txt}", style))
+                    for wline in _wrap_panel_text(step, width=42, indent="   "):
+                        out.append((wline, style))
+                out.append(("__BOX_END__", "dim"))
+
                 if plan.alternatives:
                     alt = plan.alternatives[0]
-                    alt_txt = " -> ".join(a.describe() for a in alt.actions[:2]) or t("hold_turn")
-                    alt_line = t("alt_prefix", text=alt_txt)
-                    out.append((alt_line if len(alt_line) <= 42 else alt_line[:41] + "…", "dim"))
-            if bg.in_combat and bg.shop:
-                out.append(("", "dim"))
-                out.append((t("enemy_board_header", n=len(bg.shop)), "sub"))
-                for i, m in enumerate(bg.shop, 1):
-                    out.append((f"{i}. {m.name}  {m.atk}/{m.health}", "body"))
+                    out.append(("", "dim"))
+                    out.append(("__BOX_ALT_START__", "sub"))
+                    alt_hdr = "АЛЬТЕРНАТИВНИЙ ВАРІАНТ" if uk else "ALTERNATIVE LINE"
+                    out.append((alt_hdr, "althead"))
+                    for wline in _wrap_panel_text(alt.explain_strategy(), width=45, indent=""):
+                        out.append((wline, "dim"))
+                    for astep in alt.format_steps():
+                        for wline in _wrap_panel_text(astep, width=44, indent="   "):
+                            out.append((wline, "alt"))
+                    out.append(("__BOX_END__", "dim"))
             _, fits = self.advisor.evaluate_shop(bg, observe=False)
-            out.append(("", "dim"))
-            out.append((t("board_header", n=len(bg.board)), "sub"))
-            for i, m in enumerate(bg.board, 1):
-                out.append((f"{i}. {m.name}  {m.atk}/{m.health}", "body"))
-            if not bg.board:
-                out.append((t("empty"), "dim"))
+            # Show once-per-game / targeted Hero Power timing hint (e.g. Reno / Zerek / Teron)
+            if not bg.visual_in_combat and choice is None and bg.hero_power and not bg.hero_power.passive and not bg.hero_power.used:
+                from hsbg.tavern import evaluate_hero_power_timing, snapshot_from_bg
+
+                hp_ev = evaluate_hero_power_timing(snapshot_from_bg(bg))
+                if hp_ev.get("hold_hint"):
+                    out.append(("", "dim"))
+                    out.append((f"{t('badge_hp')}: {hp_ev['hold_hint']}", "stat"))
+                elif hp_ev.get("should_use") and hp_ev.get("target_name"):
+                    out.append(("", "dim"))
+                    out.append((f"{t('badge_hp')}: дай у {hp_ev['target_name']}", "good"))
             click_comps: list[tuple[int, str]] = []
             locked_cid = getattr(self, "locked_comp_id", None)
             board_hidden = getattr(self, "board_hidden_flag", False)
@@ -578,10 +691,12 @@ class Model:
                 line_idx = len(out)
                 out.append((f"  {mark}{advice.comp.name}  ({advice.comp.power_level})", "stat" if is_lck else "body"))
                 click_comps.append((line_idx, advice.comp.comp_id))
-                line_idx2 = len(out)
-                out.append((f"    {tr_fit_describe(advice.describe())}", "dim"))
-                click_comps.append((line_idx2, advice.comp.comp_id))
-                out.append((f"    {tr_verdict(advice.verdict)}", "dim"))
+                for wline in _wrap_panel_text(f"    {tr_fit_describe(advice.describe())}", width=46, indent="    "):
+                    line_idx2 = len(out)
+                    out.append((wline, "dim"))
+                    click_comps.append((line_idx2, advice.comp.comp_id))
+                for wline in _wrap_panel_text(f"    {tr_verdict(advice.verdict)}", width=46, indent="    "):
+                    out.append((wline, "dim"))
             self.left_click_comps = click_comps
             return out
 
@@ -596,6 +711,8 @@ STYLES = {
     "good": (13.0, AppKit.NSFontWeightSemibold, C.colorWithRed_green_blue_alpha_(0.45, 0.90, 0.55, 1.0)),
     "bad":  (13.0, AppKit.NSFontWeightRegular, C.colorWithRed_green_blue_alpha_(0.95, 0.50, 0.45, 1.0)),
     "warn": (12.0, AppKit.NSFontWeightBold, C.colorWithRed_green_blue_alpha_(1.0, 0.62, 0.25, 1.0)),
+    "althead": (11.5, AppKit.NSFontWeightBold, C.colorWithRed_green_blue_alpha_(0.95, 0.78, 0.42, 0.95)),
+    "alt": (12.0, AppKit.NSFontWeightMedium, C.colorWithRed_green_blue_alpha_(0.78, 0.85, 0.96, 0.95)),
     "cardname": (9.0, AppKit.NSFontWeightMedium,
                  C.colorWithRed_green_blue_alpha_(0.90, 0.91, 0.94, 1.0)),
     "cardhave": (9.0, AppKit.NSFontWeightBold,
@@ -660,6 +777,14 @@ class ShopOverlayView(AppKit.NSView):
         ns_str.drawAtPoint_withAttributes_((tx, ty), attrs)
 
     def drawRect_(self, _rect):
+        try:
+            self._drawRect_impl(_rect)
+        except KeyboardInterrupt:
+            AppHelper.stopEventLoop()
+        except Exception as exc:
+            print(f"ShopOverlayView.drawRect_ error: {exc!r}", flush=True)
+
+    def _drawRect_impl(self, _rect):
         data = self.cached_badges
         if not data:
             return
@@ -687,11 +812,20 @@ class ShopOverlayView(AppKit.NSView):
             txt = f"{prefix}{t('badge_reroll')} {rr['score']:.0f}"
             self._draw_pill(cx_center + 1.25 * dx, 6.0, txt, rr["score"], rr.get("top", False), rr.get("affordable", True))
 
-        # 3. Per-card score badges above Bob's tavern row (clear of card art)
+        # 2b. Hero Power badge (Phase 8: shown right of Reroll when active/one-shot)
+        hp_act = actions.get("hero_power")
+        if hp_act:
+            prefix = "★ " if hp_act.get("top") else ""
+            tgt = f" -> {hp_act['target'][:10]}" if (hp_act.get("affordable") and hp_act.get("target")) else ""
+            txt = f"{prefix}{t('badge_hp')} {hp_act['score']:.0f}{tgt}"
+            self._draw_pill(cx_center + 2.35 * dx, 6.0, txt, hp_act["score"], hp_act.get("top", False), hp_act.get("affordable", False))
+
+        # 3. Per-card score badges above Bob's tavern row (or Discover row)
         n = len(cards)
+        disc_dx = dx * 1.45 if (isinstance(data, dict) and data.get("is_discover")) else dx
         card_py = max(42.0, h - 32.0)
         for i, b in enumerate(cards):
-            cx = cx_center + (i - (n - 1) / 2.0) * dx
+            cx = cx_center + (i - (n - 1) / 2.0) * disc_dx
             score = b["score"]
             top = b["top"]
             prefix = "★ " if top else ""
@@ -717,27 +851,98 @@ class PanelView(AppKit.NSView):
         return None
 
     def drawRect_(self, rect):
+        try:
+            self._drawRect_impl(rect)
+        except KeyboardInterrupt:
+            AppHelper.stopEventLoop()
+        except Exception as exc:
+            print(f"PanelView.drawRect_ error: {exc!r}", flush=True)
+
+    def needed_height(self, lines) -> float:
+        y = 12.0
+        for text, style in lines:
+            if text in ("__BOX_MAIN_START__", "__BOX_ALT_START__"):
+                y += 8.0
+            elif text == "__BOX_END__":
+                y += 8.0
+            elif not text:
+                y += 6.0
+            else:
+                y += STYLES[style][0] + 6.0
+        return y + 10.0
+
+    def _drawRect_impl(self, rect):
         bounds = self.bounds()
-        C.colorWithRed_green_blue_alpha_(0.05, 0.06, 0.09, 0.82).set()
+        bw = bounds.size.width
+        C.colorWithRed_green_blue_alpha_(0.05, 0.06, 0.09, 0.86).set()
         path = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, 10, 10)
         path.fill()
-        C.colorWithRed_green_blue_alpha_(1, 1, 1, 0.10).set()
+        C.colorWithRed_green_blue_alpha_(1, 1, 1, 0.12).set()
         path.setLineWidth_(1.0)
         path.stroke()
 
-        y = 12.0
         lines = self.cached_lines if self.cached_lines is not None else self.model.lines()
+
+        # First pass: compute y positions and box spans
+        y = 12.0
+        box_start_y = None
+        box_kind = None
+        boxes: list[tuple[str, float, float]] = []
+        line_positions: list[tuple[int, float, str, str]] = []
         y_ranges: dict[int, tuple[float, float]] = {}
+
         for idx, (text, style) in enumerate(lines):
-            size, weight, color = STYLES[style]
-            if not text:
-                y += 6
+            if text in ("__BOX_MAIN_START__", "__BOX_ALT_START__"):
+                box_start_y = y + 2.0
+                box_kind = "main" if text == "__BOX_MAIN_START__" else "alt"
+                y += 8.0
                 continue
-            y_ranges[idx] = (y, y + size + 5)
+            if text == "__BOX_END__":
+                if box_start_y is not None and box_kind is not None:
+                    boxes.append((box_kind, box_start_y, y + 4.0))
+                box_start_y = None
+                box_kind = None
+                y += 8.0
+                continue
+            if not text:
+                y += 6.0
+                continue
+            size = STYLES[style][0]
+            y_ranges[idx] = (y, y + size + 6.0)
+            x_off = 22.0 if box_kind is not None else 14.0
+            line_positions.append((x_off, y, text, style))
+            y += size + 6.0
+
+        # Draw strategy and alternative card containers
+        for kind, top_y, bot_y in boxes:
+            box_h = max(16.0, bot_y - top_y)
+            box_frame = ((10.0, top_y), (bw - 20.0, box_h))
+            if kind == "main":
+                C.colorWithRed_green_blue_alpha_(0.07, 0.16, 0.12, 0.90).set()
+                border_col = C.colorWithRed_green_blue_alpha_(0.35, 0.88, 0.52, 0.55)
+                accent_col = C.colorWithRed_green_blue_alpha_(0.40, 0.95, 0.55, 0.95)
+            else:
+                C.colorWithRed_green_blue_alpha_(0.11, 0.12, 0.17, 0.90).set()
+                border_col = C.colorWithRed_green_blue_alpha_(0.95, 0.78, 0.38, 0.45)
+                accent_col = C.colorWithRed_green_blue_alpha_(0.95, 0.78, 0.38, 0.90)
+            bpath = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(box_frame, 7, 7)
+            bpath.fill()
+            border_col.set()
+            bpath.setLineWidth_(1.2)
+            bpath.stroke()
+            # Left vertical accent bar
+            accent_col.set()
+            abar = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                ((11.5, top_y + 4.0), (3.5, max(8.0, box_h - 8.0))), 1.5, 1.5
+            )
+            abar.fill()
+
+        # Second pass: draw text
+        for x_off, ly, text, style in line_positions:
+            size, weight, color = STYLES[style]
             font = AppKit.NSFont.monospacedSystemFontOfSize_weight_(size, weight)
             attrs = {AppKit.NSFontAttributeName: font, AppKit.NSForegroundColorAttributeName: color}
-            AppKit.NSString.stringWithString_(text).drawAtPoint_withAttributes_((14.0, y), attrs)
-            y += size + 5
+            AppKit.NSString.stringWithString_(text).drawAtPoint_withAttributes_((x_off, ly), attrs)
         self.line_y_ranges = y_ranges
 
 
@@ -795,9 +1000,29 @@ class BoardView(AppKit.NSView):
             return self.hover_row
         return -1
 
-    def cards_top_y(self, num_targets: int) -> float:
+    def compact_height(self, num_targets: int) -> float:
         rows = max(1, min(BOARDS, num_targets))
         return ROWS_TOP + rows * TITLE_H + 10.0
+
+    def cards_top_y(self, num_targets: int) -> float:
+        return 12.0
+
+    def header_offset_y(self, snap: dict) -> float:
+        """Offset of the header + 3 build rows from the top of BoardView.
+
+        When expanded, the cards & explanation open ABOVE the build rows so the
+        build rows stay anchored at the exact same bottom-left screen position
+        and never jump away from the cursor on hover.
+        """
+        targets = self._active_targets(snap)
+        if not targets:
+            return 0.0
+        act = self.active_row(targets)
+        if act < 0 or act >= len(targets):
+            return 0.0
+        _, cards = targets[act]
+        num_rows = max(1, (len(cards) + BOARD_COLS - 1) // BOARD_COLS)
+        return 12.0 + num_rows * CARD_ROW_H + INSPECTOR_H + 6.0
 
     def needed_size(self, snap: dict, collapsed: bool = False) -> tuple[float, float]:
         full_w = 14.0 * 2 + BOARD_COLS * (CARD_W + CARD_GAP) - CARD_GAP
@@ -809,21 +1034,17 @@ class BoardView(AppKit.NSView):
         targets = self._active_targets(snap)
         if not targets:
             return ROWS_TOP + 28.0
-        act = self.active_row(targets)
-        top = self.cards_top_y(len(targets))
-        if act < 0 or act >= len(targets):
-            # Compact when no build is hovered/locked: hide cards & explanation completely
-            return top
-        _, cards = targets[act]
-        num_rows = max(1, (len(cards) + BOARD_COLS - 1) // BOARD_COLS)
-        return top + num_rows * CARD_ROW_H + INSPECTOR_H + 14.0
+        base_h = self.compact_height(len(targets))
+        return base_h + self.header_offset_y(snap)
 
     def row_at(self, point, num_targets: int = BOARDS) -> int:
         """Which build row a point in view coordinates falls on, or -1."""
         x, y = point
         if x < 8 or x > self.bounds().size.width - 8:
             return -1
-        top = ROWS_TOP - 3.0
+        snap = self.cached_snapshot if self.cached_snapshot is not None else {}
+        y_off = self.header_offset_y(snap) if snap else 0.0
+        top = y_off + ROWS_TOP - 3.0
         if y < top:
             return -1
         idx = int((y - top) // TITLE_H)
@@ -836,7 +1057,8 @@ class BoardView(AppKit.NSView):
             return -1
         x, y = point
         top = self.cards_top_y(num_targets)
-        if y < top or x < 14.0:
+        num_rows = max(1, (num_cards + BOARD_COLS - 1) // BOARD_COLS)
+        if y < top or y > (top + num_rows * CARD_ROW_H) or x < 14.0:
             return -1
         row = int((y - top) // CARD_ROW_H)
         rel_y = (y - top) - row * CARD_ROW_H
@@ -883,6 +1105,14 @@ class BoardView(AppKit.NSView):
         return self._images[card_id]
 
     def drawRect_(self, rect):
+        try:
+            self._drawRect_impl(rect)
+        except KeyboardInterrupt:
+            AppHelper.stopEventLoop()
+        except Exception as exc:
+            print(f"PanelView.drawRect_ error: {exc!r}", flush=True)
+
+    def _drawRect_impl(self, rect):
         bounds = self.bounds()
         C.colorWithRed_green_blue_alpha_(0.05, 0.06, 0.09, 0.88).set()
         path = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bounds, 10, 10)
@@ -909,12 +1139,13 @@ class BoardView(AppKit.NSView):
         targets = self._active_targets(snap)
         proven = snap["proven"]
         witness = snap["witness"]
+        y_off = self.header_offset_y(snap)
         title = t("builds_lobby_title")
-        label(title, 12.0, 8.0, "head")
+        label(title, 12.0, y_off + 8.0, "head")
         if self.locked_comp_id:
-            label(t("locked_badge"), bounds.size.width - 28.0, 9.0, "stat")
+            label(t("locked_badge"), bounds.size.width - 28.0, y_off + 9.0, "stat")
         elif snap["duos"]:
-            label(t("duos_warn"), 24.0 + len(title) * 8.4, 9.0, "warn")
+            label(t("duos_warn"), 24.0 + len(title) * 8.4, y_off + 9.0, "warn")
         if proven:
             parts = [f"{tr_tribe(tr)} ({witness.get(tr, '?')})" for tr in proven]
             if not snap["complete"]:
@@ -922,15 +1153,15 @@ class BoardView(AppKit.NSView):
             half = (len(parts) + 1) // 2
             pref = t("tribes_prefix")
             pad = " " * len(pref)
-            label(pref + " · ".join(parts[:half]), 14.0, 23.0, "dim")
+            label(pref + " · ".join(parts[:half]), 14.0, y_off + 23.0, "dim")
             if parts[half:]:
-                label(pad + " · ".join(parts[half:]), 14.0, 37.0, "dim")
+                label(pad + " · ".join(parts[half:]), 14.0, y_off + 37.0, "dim")
         if not targets:
-            label(t("no_viable_build"), 14.0, 42.0, "dim")
+            label(t("no_viable_build"), 14.0, y_off + 42.0, "dim")
             return
 
         act_row = self.active_row(targets)
-        y = ROWS_TOP
+        y = y_off + ROWS_TOP
         for i, (fit, cards) in enumerate(targets):
             is_locked = (self.locked_comp_id == fit.comp.comp_id)
             hot = (i == act_row)
@@ -1127,7 +1358,11 @@ class Overlay(AppKit.NSObject):
                 now = time.monotonic()
                 if (now - getattr(self, "_last_lang_toggle", 0.0)) >= 0.25:
                     self._last_lang_toggle = now
-                    toggle_lang()
+                    local_x = loc.x - lx
+                    if local_x >= 245.0:
+                        self.model.actuator.toggle()
+                    else:
+                        toggle_lang()
                     self.model._plan_dirty = True
                 return
             cid = self.view.comp_at_y(flipped_y)
@@ -1151,9 +1386,10 @@ class Overlay(AppKit.NSObject):
             snap = self.board_view.cached_snapshot or self.model.board_snapshot()
             targets = self.board_view._active_targets(snap)
             row = self.board_view.row_at(local_pt, len(targets))
+            y_off = self.board_view.header_offset_y(snap)
             if row >= 0:
                 self.board_view.toggle_lock_at_row(row, targets)
-            elif local_pt[1] < ROWS_TOP:
+            elif y_off <= local_pt[1] < (y_off + ROWS_TOP):
                 # Clicking the ▼ icon / title on the left collapses the builds panel
                 self.toggle_board_hidden()
 
@@ -1192,6 +1428,14 @@ class Overlay(AppKit.NSObject):
         self.board_view.setNeedsDisplay_(True)
 
     def tick_(self, _timer):
+        try:
+            self._tick_impl(_timer)
+        except KeyboardInterrupt:
+            AppHelper.stopEventLoop()
+        except Exception as exc:
+            print(f"Overlay.tick_ error: {exc!r}", flush=True)
+
+    def _tick_impl(self, _timer):
         if getattr(self, "hidden", False):
             for w in (self.window, self.board_window, self.shop_window):
                 w.orderOut_(None)
@@ -1207,7 +1451,7 @@ class Overlay(AppKit.NSObject):
         self._was_btn_down = btn_down
         lines = self.model.lines()
         self.view.cached_lines = lines
-        height = 24.0 + sum(6 if not t else STYLES[s][0] + 5 for t, s in lines)
+        height = self.view.needed_height(lines)
         b = hearthstone_bounds()
         # Quartz measures y downward from the top-left of the PRIMARY display;
         # AppKit measures upward from its bottom-left. Converting via mainScreen
@@ -1303,12 +1547,15 @@ class Overlay(AppKit.NSObject):
 
 
 def main():
+    autoplay = False
     for i, arg in enumerate(sys.argv[1:], 1):
         if arg in ("--lang", "-l") and i < len(sys.argv) - 1:
             set_lang(sys.argv[i + 1])
         elif arg.startswith("--lang="):
             set_lang(arg.split("=", 1)[1])
-    model = Model()
+        elif arg in ("--autoplay", "--auto"):
+            autoplay = True
+    model = Model(autoplay=autoplay)
     threading.Thread(target=model.run, daemon=True).start()
 
     app = AppKit.NSApplication.sharedApplication()

@@ -13,15 +13,21 @@ from dataclasses import dataclass, replace
 
 from .advisor import Advisor, CompFit
 from .combat import CMinion, simulate
-from .i18n import t
+from .i18n import get_lang, t
 from .tavern import (
     Action,
+    BuyMinion,
+    BuySpell,
     FreezeShop,
     GameSnapshot,
+    PlayMinion,
+    PlaySpell,
     ReorderBoard,
     RollShop,
+    SellMinion,
     TMinion,
     UpgradeTavern,
+    UseHeroPower,
     apply_action,
     legal_actions,
     snapshot_from_bg,
@@ -51,9 +57,107 @@ class TurnPlan:
         return round(self.value.total - self.baseline_value, 2)
 
     def format_steps(self) -> list[str]:
+        """Format action sequence into concise human steps (merging adjacent Buy + Play of the same card)."""
         if not self.actions:
             return [t("hold_turn")]
-        return [f"{i}. {act.describe()}" for i, act in enumerate(self.actions, 1)]
+        uk = get_lang() == "uk"
+        unit = "з" if uk else "g"
+        merged: list[str] = []
+        i = 0
+        n = len(self.actions)
+        while i < n:
+            act = self.actions[i]
+            # Merge BuyMinion(X) immediately followed by PlayMinion(X) into one clear step
+            if (
+                isinstance(act, BuyMinion)
+                and (i + 1) < n
+                and isinstance(self.actions[i + 1], PlayMinion)
+                and self.actions[i + 1].card_id == act.card_id
+            ):
+                play_act = self.actions[i + 1]
+                opt_str = f" [{play_act.option_label}]" if play_act.option_label else ""
+                tgt_str = f" -> {play_act.target_name}" if play_act.target_name else ""
+                if uk:
+                    merged.append(f"Купити й виставити {act.name}{opt_str}{tgt_str} (-{act.cost}{unit})")
+                else:
+                    merged.append(f"Buy & play {act.name}{opt_str}{tgt_str} (-{act.cost}{unit})")
+                i += 2
+                continue
+            merged.append(act.describe())
+            i += 1
+        return [f"{idx}. {step_txt}" for idx, step_txt in enumerate(merged, 1)]
+
+    def explain_strategy(self) -> str:
+        """Plain-language summary of WHY this line is recommended (no cryptic internal math)."""
+        uk = get_lang() == "uk"
+        has_up = any(isinstance(a, UpgradeTavern) for a in self.actions)
+        buys = [a for a in self.actions if isinstance(a, BuyMinion)]
+        sells = [a for a in self.actions if isinstance(a, SellMinion)]
+        spells = [a for a in self.actions if isinstance(a, (BuySpell, PlaySpell))]
+        rolls = [a for a in self.actions if isinstance(a, RollShop)]
+        hp_acts = [a for a in self.actions if isinstance(a, UseHeroPower)]
+        triples = self.end_state.triples_formed
+        tier = self.end_state.tier
+
+        if triples > 0:
+            disc_t = min(6, tier + 1)
+            return (
+                f"Збираємо золотий триплет під розкопку T{disc_t}"
+                if uk
+                else f"Complete Golden triple to Discover a T{disc_t} card"
+            )
+        if has_up and buys:
+            return (
+                f"Апаємо T{tier} і одразу добираємо карту в темп"
+                if uk
+                else f"Upgrade to T{tier} and buy a minion for tempo"
+            )
+        if has_up:
+            return (
+                f"Апаємо таверну до T{tier} по кривій (кращі карти далі)"
+                if uk
+                else f"Standard curve upgrade to T{tier} for higher-tier cards"
+            )
+        if hp_acts and not buys:
+            tgt = hp_acts[0].target_name
+            if tgt:
+                return f"Використовуємо абілку героя в {tgt}" if uk else f"Use Hero Power on {tgt}"
+            return "Граємо від абілки героя цього ходу" if uk else "Play around Hero Power tempo this turn"
+        if buys:
+            names = ", ".join(b.name for b in buys[:2])
+            if self.target_comp and self.value.synergy >= 4.0:
+                comp_nm = self.target_comp.comp.name
+                return (
+                    f"Посилюємо білд {comp_nm} (беремо {names})"
+                    if uk
+                    else f"Build toward {comp_nm} (pick up {names})"
+                )
+            if sells:
+                return (
+                    f"Міняємо слабкий слот на сильніші карти ({names})"
+                    if uk
+                    else f"Replace weak board slot with stronger stats ({names})"
+                )
+            return (
+                f"Набираємо темп і стати на стіл ({names})"
+                if uk
+                else f"Maximize board tempo and stats ({names})"
+            )
+        if spells and rolls:
+            return (
+                "Магазин слабкий — беремо дешевий спел і робимо рол"
+                if uk
+                else "Weak shop — grab cheap spell and roll for better cards"
+            )
+        if spells:
+            return "Посилюємо стіл/економіку заклинанням" if uk else "Boost board/economy with Tavern Spell"
+        if rolls:
+            return (
+                "У таверні немає хороших карт — робимо рол і шукаємо далі"
+                if uk
+                else "Current shop is weak — reroll to find playable cards"
+            )
+        return "Зберігаємо поточний стіл" if uk else "Hold current board"
 
 
 @dataclass
