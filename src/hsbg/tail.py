@@ -16,6 +16,7 @@ Two problems this solves beyond a plain ``tail -f``:
 from __future__ import annotations
 
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -59,6 +60,34 @@ class PowerLogFollower:
         self._last_data = 0.0
 
     # -- file handling --------------------------------------------------
+    def _cleanup_old_sessions(self, active: Path) -> None:
+        """Remove finished Hearthstone_* log directories so logs never pile up."""
+        if self.logs_dir != LOGS_DIR:
+            return
+        for d in self.logs_dir.glob("Hearthstone_*"):
+            if d.is_dir() and d != active:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def _seek_last_game(self, path: Path, fh) -> None:
+        """If Power.log already contains multiple games, seek to the last CREATE_GAME."""
+        marker = b"GameState.DebugPrintPower() - CREATE_GAME"
+        try:
+            size = path.stat().st_size
+            # Read at most the last 25 MB in binary mode to find the latest CREATE_GAME fast
+            read_from = max(0, size - 25_000_000)
+            with open(path, "rb") as bfh:
+                bfh.seek(read_from)
+                tail_bytes = bfh.read()
+            idx = tail_bytes.rfind(marker)
+            if idx >= 0:
+                line_start = tail_bytes.rfind(b"\n", 0, idx)
+                offset = read_from + (line_start + 1 if line_start >= 0 else idx)
+                fh.seek(offset)
+                return
+        except OSError:
+            pass
+        fh.seek(0)
+
     def _open(self, path: Path) -> bool:
         try:
             fh = open(path, "r", encoding="utf-8", errors="replace")
@@ -66,6 +95,7 @@ class PowerLogFollower:
             return False
         if self._fh:
             self._fh.close()
+        self._seek_last_game(path, fh)
         self._fh = fh
         self._inode = path.stat().st_ino
         self._partial = ""
@@ -87,11 +117,13 @@ class PowerLogFollower:
         if s != self.session or self._fh is None:
             if self._open(power):
                 self.session = s
+                self._cleanup_old_sessions(s)
                 return True
             return False
-        # Same session, but the file may have been rotated under us.
+        # Same session, but the file may have been rotated or truncated (10000KB cap) under us.
         try:
-            if power.stat().st_ino != self._inode:
+            st = power.stat()
+            if st.st_ino != self._inode or (self._fh and st.st_size < self._fh.tell()):
                 return self._open(power)
         except OSError:
             return False

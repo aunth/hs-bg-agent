@@ -12,10 +12,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-# Only GameState lines. PowerTaskList is the animation queue -- see module docstring.
+# Only GameState lines, plus PowerTaskList's GameEntity TURN change so the UI knows
+# when the client's combat animation actually finishes on screen.
 _LINE = re.compile(
     r"^D \d\d:\d\d:\d\d\.\d+ GameState\.(?P<chan>DebugPrintPower|DebugPrintEntityChoices|"
     r"DebugPrintEntitiesChosen)\(\) - (?P<body>.*)$"
+)
+_TASKLIST_TURN = re.compile(
+    r"^D \d\d:\d\d:\d\d\.\d+ PowerTaskList\.DebugPrintPower\(\) -\s*"
+    r"TAG_CHANGE Entity=GameEntity tag=TURN value=(?P<value>\d+)\b"
 )
 
 _TAG = re.compile(r"^tag=(?P<tag>[A-Za-z0-9_]+) value=(?P<value>[A-Za-z0-9_-]+)$")
@@ -181,6 +186,16 @@ def parse_lines(lines):
         return None
 
     for raw in lines:
+        if "PowerTaskList.DebugPrintPower" in raw and "Entity=GameEntity tag=TURN " in raw:
+            tm_vis = _TASKLIST_TURN.match(raw.rstrip("\n"))
+            if tm_vis:
+                done = flush()
+                if done is not None:
+                    yield done
+                yield TagChange(EntityRef(raw="GameEntity"), "VISUAL_TURN", tm_vis["value"])
+            continue
+        if "GameState.DebugPrint" not in raw:
+            continue
         m = _LINE.match(raw.rstrip("\n"))
         if not m:
             continue

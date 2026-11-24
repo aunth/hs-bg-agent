@@ -31,16 +31,20 @@ if cap:
     # Mirror the live path: the tribe tracker learns from each shop as it appears,
     # so replaying state alone is not enough.
     for ev in P.parse_file(cap):
-        model.store.apply(ev)
+        model.apply_event(ev)
         if model.bg.shop:
-            model.advisor.tracker.observe(model.bg.cards, list(model.bg.shop))
+            model.advisor.observe(model.bg)
+    model.session = Path(cap).parent
     model.last_data = 9e9    # suppress the stale banner for the preview
 
 view = ns["BoardView"].alloc().initWithModel_(model)
-w = 14.0 * 2 + ns["BOARD_MAX"] * (ns["CARD_W"] + ns["CARD_GAP"])
-h = ns["ROWS_TOP"] + ns["BOARDS"] * ns["TITLE_H"] + ns["CARD_H"] + 46.0
-view.setFrame_(((0, 0), (w, h)))
 view.hover_row = 0          # preview the first build expanded
+view.hover_card = 0         # preview hovering the first card
+snap = model.board_snapshot()
+view.cached_snapshot = snap
+w = 14.0 * 2 + ns["BOARD_COLS"] * (ns["CARD_W"] + ns["CARD_GAP"]) - ns["CARD_GAP"]
+h = view.needed_height(snap)
+view.setFrame_(((0, 0), (w, h)))
 
 rep = view.bitmapImageRepForCachingDisplayInRect_(view.bounds())
 view.cacheDisplayInRect_toBitmapImageRep_(view.bounds(), rep)

@@ -27,9 +27,13 @@ BUTTONS = {
     "TB_BaconShop_DragSell": "SELL",
     "TB_BaconShop_8p_Reroll_Button": "REROLL",
     "TB_BaconShopLockAll_Button": "FREEZE",
-    "TB_BaconShopTechUp02_Button": "UPGRADE",
-    "TB_BaconShopTechUp03_Button": "UPGRADE",
 }
+
+
+def button_label(card_id: str) -> str | None:
+    if card_id.startswith("TB_BaconShopTechUp"):
+        return "UPGRADE"
+    return BUTTONS.get(card_id)
 
 
 def snapshot(bg: BGState) -> str:
@@ -63,9 +67,9 @@ def main() -> int:
         store.apply(ev)
 
         if isinstance(ev, P.BlockStart):
-            card = ev.ref.card_id or ""
-            if card in BUTTONS:
-                print(f"\n>> {BUTTONS[card]}")
+            label = button_label(ev.ref.card_id or "")
+            if label:
+                print(f"\n>> {label}")
                 print(snapshot(bg))
             continue
 

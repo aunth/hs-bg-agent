@@ -17,6 +17,18 @@ from dataclasses import dataclass, field
 
 from . import parser as P
 from .carddb import CardDB
+from .combat import CMinion
+
+BOB_NAME = "Bartender Bob"
+COMBAT_KEYWORDS = {
+    "TAUNT": "taunt",
+    "DIVINE_SHIELD": "divine_shield",
+    "POISONOUS": "poisonous",
+    "VENOMOUS": "venomous",
+    "WINDFURY": "windfury",
+    "MEGA_WINDFURY": "mega_windfury",
+    "REBORN": "reborn",
+}
 
 
 @dataclass
@@ -43,6 +55,8 @@ class Entity:
 class EntityStore:
     def __init__(self) -> None:
         self.entities: dict[int, Entity] = {}
+        self.in_play: dict[int, Entity] = {}
+        self.in_hand: dict[int, Entity] = {}
         self.game_entity_id: int | None = None
         self.players: list[P.PlayerDecl] = []
         # Player-level tags arrive keyed by battletag, which never appears in a
@@ -50,6 +64,20 @@ class EntityStore:
         # Keep them by name and bind the names to players in arrival order.
         self.by_name: dict[str, dict[str, str]] = {}
         self._name_order: list[str] = []
+        self._local_name: str | None = None
+        self._bob_name: str | None = None
+
+    def _sync_zone(self, e: Entity) -> None:
+        z = e.tags.get("ZONE")
+        if z == "PLAY":
+            self.in_play[e.id] = e
+            self.in_hand.pop(e.id, None)
+        elif z == "HAND":
+            self.in_hand[e.id] = e
+            self.in_play.pop(e.id, None)
+        else:
+            self.in_play.pop(e.id, None)
+            self.in_hand.pop(e.id, None)
 
     # -- lookup ---------------------------------------------------------
     def get(self, eid: int) -> Entity:
@@ -81,18 +109,38 @@ class EntityStore:
         bots = [p for p in self.players if p.is_bot_slot]
         return bots[0] if bots else None
 
+    def _resolve_name_key(self, is_local: bool) -> str | None:
+        if is_local:
+            if self._local_name and self._local_name in self.by_name:
+                return self._local_name
+            for n in self._name_order:
+                if n != BOB_NAME and "#" in n:
+                    return n
+            for n in self._name_order:
+                if n != BOB_NAME:
+                    return n
+            return None
+        if self._bob_name and self._bob_name in self.by_name:
+            return self._bob_name
+        if BOB_NAME in self.by_name:
+            return BOB_NAME
+        local_key = self._resolve_name_key(is_local=True)
+        for n in self._name_order:
+            if n != local_key:
+                return n
+        return None
+
     def player_tags(self, player_id: int) -> dict[str, str]:
         """Tags for a player, merged from id-keyed and name-keyed sources."""
         merged: dict[str, str] = {}
         for p in self.players:
             if p.player_id == player_id:
                 merged.update(self.entities.get(p.entity_id, Entity(0)).tags)
-        # First distinct name seen belongs to the local player, second to the
-        # opposing slot. Heuristic -- see module docstring of tools/replay.py.
         local = self.local_player
-        idx = 0 if (local and local.player_id == player_id) else 1
-        if idx < len(self._name_order):
-            merged.update(self.by_name.get(self._name_order[idx], {}))
+        is_local = bool(local and local.player_id == player_id)
+        name_key = self._resolve_name_key(is_local=is_local)
+        if name_key is not None:
+            merged.update(self.by_name.get(name_key, {}))
         return merged
 
     # -- ingest ---------------------------------------------------------
@@ -110,24 +158,37 @@ class EntityStore:
                 e = self.get(ev.id)
                 e.card_id = ev.card_id or e.card_id
                 e.tags.update(ev.tags)
+                self._sync_zone(e)
             case P.ShowEntity():
                 e = self.resolve(ev.ref)
                 if e:
                     e.card_id = ev.card_id or e.card_id
                     e.tags.update(ev.tags)
+                    self._sync_zone(e)
             case P.HideEntity():
                 e = self.resolve(ev.ref)
                 if e:
                     e.tags[ev.tag] = ev.value
+                    if ev.tag == "ZONE":
+                        self._sync_zone(e)
+            case P.ChoiceOffered() | P.ChoiceMade():
+                if ev.player and ev.player != BOB_NAME:
+                    self._local_name = ev.player
             case P.TagChange():
                 e = self.resolve(ev.ref)
                 if e is not None:
                     e.tags[ev.tag] = ev.value
+                    if ev.tag == "ZONE":
+                        self._sync_zone(e)
                 elif ev.ref.name:
                     n = ev.ref.name
                     if n not in self.by_name:
                         self.by_name[n] = {}
                         self._name_order.append(n)
+                    if n == BOB_NAME:
+                        self._bob_name = n
+                    elif "#" in n and self._local_name is None:
+                        self._local_name = n
                     self.by_name[n][ev.tag] = ev.value
 
 
@@ -151,6 +212,86 @@ class Minion:
         return f"{label}{flags} {self.atk}/{self.health} (t{self.tier}){tribe}"
 
 
+@dataclass
+class ShopSpell:
+    id: int
+    card_id: str
+    name: str
+    cost: int
+    tier: int
+    pos: int
+    frozen: bool = False
+
+    def __str__(self) -> str:
+        mark = "~" if self.frozen else ""
+        return f"{self.name or self.card_id}{mark} ({self.cost}g, t{self.tier})"
+
+
+@dataclass
+class HeroPower:
+    id: int
+    card_id: str
+    name: str
+    cost: int
+    used: bool
+    passive: bool
+    playable: bool
+
+
+@dataclass
+class OpponentBoard:
+    hero_card_id: str
+    player_id: int
+    turn_seen: int
+    tier: int
+    minions: list[CMinion]
+
+
+class OpponentTracker:
+    def __init__(self) -> None:
+        self.boards: dict[str, OpponentBoard] = {}
+        self.by_player_id: dict[int, OpponentBoard] = {}
+        self.last_enemy_board: list[CMinion] = []
+
+    def reset(self) -> None:
+        self.boards.clear()
+        self.by_player_id.clear()
+        self.last_enemy_board = []
+
+    def observe_combat(self, bg: BGState) -> OpponentBoard | None:
+        if not bg.in_combat:
+            return None
+        bob = bg.s.bob_player
+        if not bob:
+            return None
+        opp_minions = bg.combat_minions(bob.player_id)
+        if not opp_minions:
+            return None
+        enemy_hero = bg.combat_enemy_hero
+        hero_card_id = enemy_hero.card_id if enemy_hero else ""
+        player_id = bg.next_opponent_id or (enemy_hero.int_tag("PLAYER_ID") if enemy_hero else 0)
+        tier = (enemy_hero.int_tag("PLAYER_TECH_LEVEL") if enemy_hero else 0) or bg.tier
+        board = OpponentBoard(
+            hero_card_id=hero_card_id,
+            player_id=player_id,
+            turn_seen=bg.turn,
+            tier=tier,
+            minions=opp_minions,
+        )
+        key = hero_card_id or str(player_id)
+        self.boards[key] = board
+        if player_id:
+            self.by_player_id[player_id] = board
+        self.last_enemy_board = opp_minions
+        return board
+
+    def expected_opponent_board(self, bg: BGState) -> list[CMinion]:
+        opp_id = bg.next_opponent_id
+        if opp_id in self.by_player_id:
+            return self.by_player_id[opp_id].minions
+        return self.last_enemy_board
+
+
 class BGState:
     """A read-only view over an EntityStore, projected for Battlegrounds."""
 
@@ -169,11 +310,17 @@ class BGState:
         tier = entity.int_tag("TECH_LEVEL") or (card.tier if card else 0)
         return name, tier, (card.tribe if card else "")
 
+    def _play_entities(self):
+        return self.s.in_play.values() if (self.s.in_play or self.s.in_hand) else self.s.entities.values()
+
+    def _hand_entities(self):
+        return self.s.in_hand.values() if (self.s.in_play or self.s.in_hand) else self.s.entities.values()
+
     def _minions(self, controller: int | None) -> list[Minion]:
         if controller is None:
             return []
         out = []
-        for e in self.s.entities.values():
+        for e in self._play_entities():
             if e.tag("CARDTYPE") != "MINION" or e.tag("ZONE") != "PLAY":
                 continue
             if e.int_tag("CONTROLLER", -1) != controller:
@@ -195,10 +342,70 @@ class BGState:
             )
         return sorted(out, key=lambda m: m.pos)
 
+    def combat_minions(self, controller: int | None) -> list[CMinion]:
+        """Board minions in ZONE_POSITION order, ready for combat simulation."""
+        if controller is None:
+            return []
+        ordered: list[tuple[int, int, CMinion]] = []
+        for e in self._play_entities():
+            if e.tag("CARDTYPE") != "MINION" or e.tag("ZONE") != "PLAY":
+                continue
+            if e.int_tag("CONTROLLER", -1) != controller:
+                continue
+            card = self.cards.by_id(e.card_id) if self.cards else None
+            name, tier, _ = self._card_name(e)
+            kw = {py: e.int_tag(tag) == 1 for tag, py in COMBAT_KEYWORDS.items()}
+            golden = e.int_tag("PREMIUM") == 1
+            base_atk = (card.attack * (2 if golden else 1)) if card else None
+            base_health = (card.health * (2 if golden else 1)) if card else None
+            current_health = max(0, e.int_tag("HEALTH") - e.int_tag("DAMAGE"))
+            ordered.append((
+                e.int_tag("ZONE_POSITION"),
+                e.id,
+                CMinion(
+                    card_id=e.card_id,
+                    name=name,
+                    atk=e.int_tag("ATK"),
+                    health=current_health,
+                    tier=tier or 1,
+                    golden=golden,
+                    base_atk=base_atk,
+                    base_health=base_health,
+                    **kw,
+                ),
+            ))
+        ordered.sort(key=lambda item: (item[0], item[1]))
+        return [m for _, _, m in ordered]
+
     @property
     def shop(self) -> list[Minion]:
         bob = self.s.bob_player
         return self._minions(bob.player_id if bob else None)
+
+    @property
+    def shop_spells(self) -> list[ShopSpell]:
+        bob = self.s.bob_player
+        if not bob:
+            return []
+        out = []
+        for e in self._play_entities():
+            if e.tag("CARDTYPE") != "BATTLEGROUND_SPELL" or e.tag("ZONE") != "PLAY":
+                continue
+            if e.int_tag("CONTROLLER", -1) != bob.player_id:
+                continue
+            name, tier, _ = self._card_name(e)
+            out.append(
+                ShopSpell(
+                    id=e.id,
+                    card_id=e.card_id,
+                    name=name,
+                    cost=e.int_tag("COST"),
+                    tier=tier,
+                    pos=e.int_tag("ZONE_POSITION"),
+                    frozen=e.int_tag("FROZEN") == 1,
+                )
+            )
+        return sorted(out, key=lambda s: s.pos)
 
     @property
     def board(self) -> list[Minion]:
@@ -211,13 +418,173 @@ class BGState:
         if not me:
             return []
         out = []
-        for e in self.s.entities.values():
+        for e in self._hand_entities():
             if e.tag("ZONE") != "HAND" or e.int_tag("CONTROLLER", -1) != me.player_id:
                 continue
             name, tier, tribe = self._card_name(e)
-            out.append(Minion(e.id, e.card_id, name, e.int_tag("ATK"), e.int_tag("HEALTH"),
-                              tier, e.int_tag("ZONE_POSITION"), tribe=tribe))
-        return out
+            out.append(
+                Minion(
+                    e.id,
+                    e.card_id,
+                    name,
+                    e.int_tag("ATK"),
+                    e.int_tag("HEALTH"),
+                    tier,
+                    e.int_tag("ZONE_POSITION"),
+                    golden=e.int_tag("PREMIUM") == 1,
+                    tribe=tribe,
+                )
+            )
+        return sorted(out, key=lambda m: m.pos)
+
+    @property
+    def hand_spells(self) -> list[ShopSpell]:
+        me = self.s.local_player
+        if not me:
+            return []
+        out = []
+        for e in self._hand_entities():
+            if e.tag("ZONE") != "HAND" or e.int_tag("CONTROLLER", -1) != me.player_id:
+                continue
+            if e.int_tag("LITERALLY_UNPLAYABLE") == 1 or e.int_tag("CANT_PLAY") == 1:
+                continue
+            card = self.cards.by_id(e.card_id) if self.cards else None
+            ctype = e.tag("CARDTYPE") or (card.type if card else "")
+            if ctype not in ("SPELL", "BATTLEGROUND_SPELL"):
+                continue
+            name, tier, _ = self._card_name(e)
+            out.append(
+                ShopSpell(
+                    id=e.id,
+                    card_id=e.card_id,
+                    name=name,
+                    cost=e.int_tag("COST"),
+                    tier=tier,
+                    pos=e.int_tag("ZONE_POSITION"),
+                    frozen=e.int_tag("FROZEN") == 1,
+                )
+            )
+        return sorted(out, key=lambda s: s.pos)
+
+    @property
+    def trinkets(self) -> list[Entity]:
+        me = self.s.local_player
+        if not me:
+            return []
+        return [
+            e
+            for e in self._play_entities()
+            if e.tag("ZONE") == "PLAY"
+            and e.int_tag("CONTROLLER", -1) == me.player_id
+            and e.tag("CARDTYPE") == "BATTLEGROUND_TRINKET"
+            and e.card_id not in ("BG30_Trinket_1st", "BG30_Trinket_2nd")
+        ]
+
+    @property
+    def hero_power(self) -> HeroPower | None:
+        me = self.s.local_player
+        if not me:
+            return None
+        for e in self._play_entities():
+            if (
+                e.tag("CARDTYPE") == "HERO_POWER"
+                and e.tag("ZONE") == "PLAY"
+                and e.int_tag("CONTROLLER", -1) == me.player_id
+            ):
+                name, _, _ = self._card_name(e)
+                cost = e.int_tag("COST", 0)
+                passive = e.int_tag("HIDE_COST") == 1
+                used = (
+                    e.int_tag("EXHAUSTED") == 1
+                    or e.int_tag("BACON_HERO_POWER_ACTIVATED") == 1
+                )
+                disabled = (
+                    e.int_tag("HERO_POWER_DISABLED") == 1
+                    or e.int_tag("CANT_PLAY") == 1
+                    or e.int_tag("LITERALLY_UNPLAYABLE") == 1
+                )
+                playable = (not passive) and (not used) and (not disabled)
+                return HeroPower(
+                    id=e.id,
+                    card_id=e.card_id,
+                    name=name,
+                    cost=cost,
+                    used=used,
+                    passive=passive,
+                    playable=playable,
+                )
+        return None
+
+    @property
+    def reroll_cost(self) -> int:
+        me = self.s.local_player
+        if not me:
+            return 1
+        for e in self._play_entities():
+            if (
+                e.tag("ZONE") == "PLAY"
+                and e.int_tag("CONTROLLER", -1) == me.player_id
+                and e.card_id == "TB_BaconShop_8p_Reroll_Button"
+            ):
+                return e.int_tag("COST", 1)
+        return 1
+
+    @property
+    def buy_cost(self) -> int:
+        me = self.s.local_player
+        if not me:
+            return 3
+        for e in self._play_entities():
+            if (
+                e.tag("ZONE") == "PLAY"
+                and e.int_tag("CONTROLLER", -1) == me.player_id
+                and e.card_id == "TB_BaconShop_DragBuy"
+            ):
+                if "COST" in e.tags:
+                    return max(0, e.int_tag("COST", 3))
+                return 3
+        return 3
+
+    @property
+    def upgrade_cost(self) -> int | None:
+        """Current tavern tier upgrade cost in gold, or None if unavailable."""
+        me = self.s.local_player
+        if not me:
+            return None
+        for e in self._play_entities():
+            if (
+                e.tag("ZONE") == "PLAY"
+                and e.int_tag("CONTROLLER", -1) == me.player_id
+                and e.card_id.startswith("TB_BaconShopTechUp")
+            ):
+                return e.int_tag("COST")
+        return None
+
+    @property
+    def in_combat(self) -> bool:
+        raw = self.raw_turn
+        return raw > 0 and raw % 2 == 0
+
+    @property
+    def visual_raw_turn(self) -> int:
+        """The animation queue's (PowerTaskList) TURN tag on GameEntity, or raw_turn if unset.
+
+        GameState receives the next shop turn from the server ~0.8s after combat
+        starts, whereas PowerTaskList advances GameEntity TURN only when the
+        combat animation actually finishes on screen (~20-35s later).
+        """
+        g = self.s.entities.get(self.s.game_entity_id or -1)
+        if not g:
+            return 0
+        return g.int_tag("VISUAL_TURN") or g.int_tag("TURN")
+
+    @property
+    def visual_in_combat(self) -> bool:
+        """True while the client is visually in the combat phase on screen."""
+        if self.in_combat:
+            return True
+        vraw = self.visual_raw_turn
+        return vraw > 0 and vraw % 2 == 0
 
     def _my_tags(self) -> dict[str, str]:
         me = self.s.local_player
@@ -321,3 +688,32 @@ class BGState:
             if e.tag("CARDTYPE") == "HERO" and e.tag("ZONE") == "HAND"
             and e.int_tag("CONTROLLER", -1) == me.player_id
         ]
+
+    @property
+    def next_opponent_id(self) -> int:
+        raw = self._my_tags().get("NEXT_OPPONENT_PLAYER_ID")
+        if raw is not None:
+            try:
+                val = int(raw)
+                if val:
+                    return val
+            except (TypeError, ValueError):
+                pass
+        hero = self._hero_entity()
+        if hero:
+            return hero.int_tag("NEXT_OPPONENT_PLAYER_ID", 0)
+        return 0
+
+    @property
+    def combat_enemy_hero(self) -> Entity | None:
+        bob = self.s.bob_player
+        if not bob:
+            return None
+        for e in self.s.entities.values():
+            if (
+                e.tag("CARDTYPE") == "HERO"
+                and e.tag("ZONE") == "PLAY"
+                and e.int_tag("CONTROLLER", -1) == bob.player_id
+            ):
+                return e
+        return None
